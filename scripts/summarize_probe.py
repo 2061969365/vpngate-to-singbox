@@ -14,24 +14,48 @@ import json
 import sys
 
 
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    """Linear-interpolation percentile (numpy 'linear' method)."""
+    if not sorted_values:
+        return 0.0
+    rank = pct / 100.0 * (len(sorted_values) - 1)
+    low = int(rank)
+    high = min(low + 1, len(sorted_values) - 1)
+    frac = rank - low
+    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+
+
 def summarize(samples: list[dict]) -> dict[str, dict]:
     report: dict[str, dict] = {}
     for sample in samples:
         tag = str(sample.get("endpoint", "?"))
         entry = report.setdefault(tag, {"latency_ok": 0, "latency_total": 0,
-                                        "latency_sum": 0.0, "speed_mbps": 0.0})
+                                        "latency_sum": 0.0, "latency_vals": [],
+                                        "speed_mbps": 0.0, "speed_vals": [],
+                                        "dial_failures": 0, "http_failures": 0})
         if sample.get("kind") == "speed":
             if sample.get("ok"):
                 entry["speed_mbps"] = max(entry["speed_mbps"], float(sample.get("mbps", 0.0)))
+                entry["speed_vals"].append(float(sample.get("mbps", 0.0)))
         else:
             entry["latency_total"] += 1
             if sample.get("ok"):
                 entry["latency_ok"] += 1
                 entry["latency_sum"] += float(sample.get("seconds", 0.0))
+                entry["latency_vals"].append(float(sample.get("seconds", 0.0)))
+            elif str(sample.get("reason", "")) == "dial":
+                entry["dial_failures"] += 1
+            else:
+                entry["http_failures"] += 1
     for entry in report.values():
         ok = entry["latency_ok"]
         entry["latency_avg"] = (entry["latency_sum"] / ok) if ok else 0.0
         entry["success_rate"] = (ok / entry["latency_total"]) if entry["latency_total"] else 0.0
+        vals = sorted(entry["latency_vals"])
+        entry["latency_p50"] = _percentile(vals, 50)
+        entry["latency_p95"] = _percentile(vals, 95)
+        speeds = sorted(entry["speed_vals"])
+        entry["speed_min"] = speeds[0] if speeds else 0.0
     return report
 
 
@@ -41,15 +65,28 @@ def qualifies(entry: dict, min_success_rate: float, min_samples: int) -> bool:
 
 
 def render_markdown(report: dict[str, dict], min_success_rate: float, min_samples: int) -> str:
-    lines = ["| endpoint | latency ok/total | avg latency | speed | verdict |",
+    lines = ["| endpoint | latency ok/total | avg (p50/p95) | speed | verdict |",
              "|---|---|---|---|---|"]
+    dial_failures = 0
+    http_failures = 0
+    worst_speed: float | None = None
     for tag in sorted(report):
         entry = report[tag]
         verdict = "PASS" if qualifies(entry, min_success_rate, min_samples) else "FAIL"
         lines.append(
             f"| {tag} | {entry['latency_ok']}/{entry['latency_total']} "
-            f"| {entry['latency_avg']:.2f}s | {entry['speed_mbps']:.1f} Mbps | {verdict} |"
+            f"| {entry['latency_avg']:.2f}s "
+            f"(p50 {entry['latency_p50']:.2f}s/p95 {entry['latency_p95']:.2f}s) "
+            f"| {entry['speed_mbps']:.1f} Mbps | {verdict} |"
         )
+        dial_failures += entry["dial_failures"]
+        http_failures += entry["http_failures"]
+        if entry["speed_vals"]:
+            worst_speed = (entry["speed_min"] if worst_speed is None
+                           else min(worst_speed, entry["speed_min"]))
+    lines.append(f"\ndial failures: {dial_failures}, http failures: {http_failures}")
+    if worst_speed is not None:
+        lines.append(f"worst ok speed: {worst_speed:.1f} Mbps")
     return "\n".join(lines) + "\n"
 
 

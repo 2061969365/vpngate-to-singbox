@@ -67,8 +67,12 @@ jobs:
           python-version: "3.11"
       - name: Fetch real VPNGate snapshot
         run: |
-          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
-            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+          for attempt in 1 2 3; do
+            curl -m 20 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv && break
+            echo "fetch attempt $attempt failed, retrying..."
+            sleep 5
+          done
+          test -s /tmp/vpngate.csv
           wc -c /tmp/vpngate.csv
           grep -c -v '^\*' /tmp/vpngate.csv
       - name: Convert top TCP nodes
@@ -100,8 +104,12 @@ jobs:
           python-version: "3.11"
       - name: Fetch real VPNGate snapshot
         run: |
-          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
-            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+          for attempt in 1 2 3; do
+            curl -m 20 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv && break
+            echo "fetch attempt $attempt failed, retrying..."
+            sleep 5
+          done
+          test -s /tmp/vpngate.csv
       - name: Convert top TCP nodes with mixed inbound
         run: |
           python vpngate_to_singbox.py --csv /tmp/vpngate.csv \
@@ -153,8 +161,12 @@ jobs:
           python-version: "3.11"
       - name: Fetch real VPNGate snapshot
         run: |
-          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
-            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+          for attempt in 1 2 3; do
+            curl -m 20 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv && break
+            echo "fetch attempt $attempt failed, retrying..."
+            sleep 5
+          done
+          test -s /tmp/vpngate.csv
           python vpngate_to_singbox.py --csv /tmp/vpngate.csv \
             --limit 3 --output /tmp/singbox-stab.json --tag vpngate \
             --mixed 127.0.0.1:18080
@@ -167,8 +179,10 @@ jobs:
           : > /tmp/probe.jsonl
           record() { python3 - "$@" <<'EOF'
           import json, sys
-          rec = {"endpoint": sys.argv[1], "kind": sys.argv[2], "ok": sys.argv[3] == "1",
-                 "seconds": float(sys.argv[4]), "mbps": float(sys.argv[5]) if len(sys.argv) > 5 else 0.0}
+          argv = sys.argv + [""]
+          rec = {"endpoint": argv[1], "kind": argv[2], "ok": argv[3] == "1",
+                 "seconds": float(argv[4]), "mbps": float(argv[5] or 0.0),
+                 "reason": argv[6] or ("ok" if argv[3] == "1" else "unknown")}
           open("/tmp/probe.jsonl", "a").write(json.dumps(rec) + "\n")
           print(rec, flush=True)
           EOF
@@ -188,9 +202,9 @@ jobs:
               if out=$(curl -m 20 -s -o /dev/null -x socks5h://127.0.0.1:18080 \
                   -w "%{http_code} %{time_total}" https://www.gstatic.com/generate_204); then
                 set -- $out
-                if [ "$1" = "204" ]; then record "vpngate-$i" latency 1 "$2"; else record "vpngate-$i" latency 0 "$2"; fi
+                if [ "$1" = "204" ]; then record "vpngate-$i" latency 1 "$2" 0 "http_204"; else record "vpngate-$i" latency 0 "$2" 0 "http_$1"; fi
               else
-                record "vpngate-$i" latency 0 0
+                record "vpngate-$i" latency 0 0 0 "dial"
               fi
               sleep 8
             done
@@ -198,9 +212,9 @@ jobs:
                 -w "%{http_code} %{time_total} %{size_download}" "https://speed.cloudflare.com/__down?bytes=10000000"); then
               set -- $out
               mbps=$(python3 -c "print(round($3*8/float($2)/1e6, 2) if float($2) > 0 else 0)")
-              if [ "$1" = "200" ] && [ "$3" != "0" ]; then record "vpngate-$i" speed 1 "$2" "$mbps"; else record "vpngate-$i" speed 0 "$2" 0; fi
+              if [ "$1" = "200" ] && [ "$3" != "0" ]; then record "vpngate-$i" speed 1 "$2" "$mbps" "dl_ok"; else record "vpngate-$i" speed 0 "$2" 0 "http_$1"; fi
             else
-              record "vpngate-$i" speed 0 0 0
+              record "vpngate-$i" speed 0 0 0 "dial"
             fi
           done
           pkill -f singbox-stab || true
@@ -209,6 +223,61 @@ jobs:
       - name: Summarize and gate
         run: |
           python scripts/summarize_probe.py --input /tmp/probe.jsonl --summary-file "$GITHUB_STEP_SUMMARY"
+      - name: Upload raw probe data
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: probe-${{ github.run_id }}
+          path: /tmp/probe.jsonl
+          retention-days: 90
+      - name: Append history to data branch
+        if: always()
+        run: |
+          [ "${{ github.event_name }}" = "schedule" ] || { echo "not a scheduled run, skip"; exit 0; }
+          [ -f /tmp/probe.jsonl ] || { echo "no probe data, skip"; exit 0; }
+          python3 - <<'EOF'
+          import datetime, json
+          samples = [json.loads(l) for l in open("/tmp/probe.jsonl") if l.strip()]
+          by_ep = {}
+          for s in samples:
+              e = by_ep.setdefault(s["endpoint"], {"lat_ok": 0, "lat_total": 0, "mbps": 0.0})
+              if s["kind"] == "latency":
+                  e["lat_total"] += 1
+                  e["lat_ok"] += bool(s["ok"])
+              elif s["ok"]:
+                  e["mbps"] = max(e["mbps"], float(s.get("mbps", 0.0)))
+          row = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "run_id": "${{ github.run_id }}", "endpoints": by_ep}
+          open("/tmp/history-row.jsonl", "w").write(json.dumps(row) + "\n")
+          print("history row:", row)
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch origin data 2>/dev/null || true
+            git checkout -B data origin/data 2>/dev/null || git checkout -B data
+            cat /tmp/history-row.jsonl >> history.jsonl
+            git add history.jsonl
+            git commit -m "stability history ${{ github.run_id }}" || { echo "nothing to commit"; exit 0; }
+            git pull --rebase origin data 2>/dev/null || true
+            git push origin data && break
+            echo "push conflict, retrying..."
+            sleep 10
+          done
+      - name: File tracking issue when gate is red
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create stability-tracking --color B60205 \
+            --description "stability gate went red" 2>/dev/null || true
+          body="Stability gate red: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list --label stability-tracking --state open --json number --jq '.[0].number')
+          if [ -z "$existing" ] || [ "$existing" = "null" ]; then
+            gh issue create --title "Stability gate red" --body "$body" --label stability-tracking
+          else
+            gh issue comment "$existing" --body "$body"
+          fi
 
   railway-build:
     needs: test
@@ -221,9 +290,10 @@ jobs:
       - name: Smoke test (boot + routes, no TUN)
         run: |
           docker run -d --name vpngate-test -p 8080:8080 \
-            -e PORT=8080 -e PROXY_USER=u -e PROXY_PASS=test-pass \
+            -e PORT=8080 -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
+            -e ADMIN_TOKEN=smoke-admin-token-0123456789 \
             vpngate-railway:test
-          for i in $(seq 1 12); do
+          for i in $(seq 1 18); do
             if curl -m 5 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"; then
               echo "healthz OK after ~$((i * 10))s"
               break
@@ -232,7 +302,25 @@ jobs:
           done
           curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"
           curl -m 10 -s http://127.0.0.1:8080/ui | grep -q "api/status"
-          curl -m 10 -s http://127.0.0.1:8080/api/status | python3 -m json.tool
+          if curl -m 10 -s http://127.0.0.1:8080/api/status | grep -q "401"; then
+            echo "unauthenticated /api/status correctly rejected"
+          else
+            echo "expected 401 without token"; exit 1
+          fi
+          curl -m 10 -s -H "Authorization: Bearer smoke-admin-token-0123456789" \
+            http://127.0.0.1:8080/api/status | tee /tmp/smoke-status.json | python3 -m json.tool
+          python3 - <<'EOF'
+          import json
+          status = json.load(open("/tmp/smoke-status.json"))
+          assert len(status["endpoints"]) >= 1, "smoke: no endpoints loaded"
+          assert status["countries"], "smoke: no countries listed"
+          assert status["refresh_ok"] >= 1, status
+          print("smoke assertions OK:", len(status["endpoints"]), "endpoints,",
+                len(status["countries"]), "countries")
+          EOF
+          curl -m 10 -s -X POST -H "Authorization: Bearer smoke-admin-token-0123456789" \
+            http://127.0.0.1:8080/api/switch -d '{"tag":"auto"}' | grep -q '"ok": true'
+          echo "switch-to-auto OK"
           echo "--- container log tail ---"
           docker logs vpngate-test 2>&1 | tail -n 10
       - name: Cleanup

@@ -8,4 +8,9 @@ dial.log
 dial.err
 sing-box.zip
 sbtest/
+nodes.json
+state.json
+singbox-railway.json
+singbox-railway.json.last-good
+singbox-railway.json.stderr.log
 

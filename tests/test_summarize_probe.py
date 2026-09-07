@@ -74,6 +74,37 @@ class SummarizeTests(unittest.TestCase):
 
         self.assertEqual(1, code)
 
+    def test_p50_p95_reported(self) -> None:
+        samples = [latency("vpngate-0", seconds=float(s)) for s in (1, 2, 3, 4, 5, 6)]
+
+        _, markdown = self.mod.run(samples)
+
+        self.assertIn("p50 3.50s", markdown)
+        self.assertIn("p95 5.75s", markdown)
+
+    def test_worst_ok_speed_reported(self) -> None:
+        samples = [latency("vpngate-0") for _ in range(4)]
+        samples.append(speed("vpngate-0", mbps=47.0))
+        samples.append(speed("vpngate-1", mbps=19.0))
+
+        _, markdown = self.mod.run(samples, min_samples=3)
+
+        self.assertIn("worst ok speed: 19.0 Mbps", markdown)
+
+    def test_dial_vs_http_failures_distinguished(self) -> None:
+        samples = [latency("vpngate-0") for _ in range(4)]
+        failing = dict(latency("vpngate-0", ok=False, seconds=0.0))
+        failing["reason"] = "dial"
+        samples.append(failing)
+        failing = dict(latency("vpngate-0", ok=False, seconds=0.5))
+        failing["reason"] = "http_500"
+        samples.append(failing)
+
+        _, markdown = self.mod.run(samples, min_samples=3)
+
+        self.assertIn("dial failures: 1", markdown)
+        self.assertIn("http failures: 1", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

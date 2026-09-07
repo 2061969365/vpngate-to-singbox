@@ -7,6 +7,9 @@ import csv
 import io
 import json
 import re
+import socket
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 DEFAULT_USERNAME = "vpn"
@@ -94,14 +97,32 @@ def ovpn_to_endpoint(
     }
 
 
-def snapshot_to_endpoints(
-    csv_text: str,
-    limit: int = 8,
-    tag_prefix: str = "vpngate",
-    username: str = DEFAULT_USERNAME,
-    password: str = DEFAULT_PASSWORD,
-) -> list[dict]:
-    """Parse a VPNGate CSV snapshot, keep TCP-convertible rows, rank by Speed desc."""
+def probe_tcp_latency(host: str, port: int, timeout: int = 5) -> int:
+    """Measure TCP handshake latency in ms; return 0 when unreachable.
+
+    This is a real-connection pre-filter: VPNGate advertises Speed values
+    that say nothing about whether the node accepts connections right now.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = None
+    start = time.monotonic()
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        return max(1, int((time.monotonic() - start) * 1000))
+    except OSError:
+        return 0
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _iter_tcp_candidates(csv_text, username=DEFAULT_USERNAME, password=DEFAULT_PASSWORD):
+    """Yield (speed, country, country_short, untagged-endpoint) for TCP rows."""
     lines = [ln for ln in csv_text.splitlines() if ln and not ln.startswith("*")]
     if not lines:
         raise ValueError("empty snapshot")
@@ -111,7 +132,7 @@ def snapshot_to_endpoints(
     if not reader.fieldnames or "OpenVPN_ConfigData_Base64" not in reader.fieldnames:
         raise ValueError("snapshot columns are incomplete")
 
-    candidates: list[tuple[int, dict]] = []
+    found = False
     for row in reader:
         encoded = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
         if not encoded:
@@ -125,16 +146,98 @@ def snapshot_to_endpoints(
             speed = int((row.get("Speed") or "0").strip() or "0")
         except ValueError:
             speed = 0
-        candidates.append((speed, endpoint))
-
-    if not candidates:
+        found = True
+        yield (speed, (row.get("CountryLong") or "").strip(),
+               (row.get("CountryShort") or "").strip().upper(), endpoint)
+    if not found:
         raise ValueError("snapshot contains no TCP-convertible nodes")
-    candidates.sort(key=lambda item: item[0], reverse=True)
+
+
+def snapshot_to_nodes(
+    csv_text: str,
+    limit: int = 8,
+    probe: bool = True,
+    probe_fn=None,
+    probe_timeout: int = 5,
+    probe_workers: int = 20,
+    probe_pool: int = 30,
+    username: str = DEFAULT_USERNAME,
+    password: str = DEFAULT_PASSWORD,
+) -> list[dict]:
+    """Parse a snapshot into node dicts with country + measured latency.
+
+    Nodes are real-connection filtered (TCP handshake must succeed) and
+    sorted by measured latency. With probe=False falls back to Speed ranking
+    with latency_ms=None. Returns [] when nothing is reachable (caller
+    decides whether that is a failure).
+    """
+    candidates = list(_iter_tcp_candidates(csv_text, username, password))
+    check = probe_fn if probe_fn is not None else (
+        lambda host, port: probe_tcp_latency(host, port, probe_timeout))
+
+    def _node(speed, country, country_short, endpoint, latency_ms):
+        return {"server": endpoint["server"], "server_port": endpoint["server_port"],
+                "country": country, "country_short": country_short,
+                "speed": speed, "latency_ms": latency_ms, "endpoint": endpoint}
+
+    if not probe:
+        ranked = sorted(candidates, key=lambda item: item[0], reverse=True)[:limit]
+        return [_node(speed, country, short, ep, None)
+                for speed, country, short, ep in ranked]
+
+    pool = sorted(candidates, key=lambda item: item[0], reverse=True)[:probe_pool]
+    latencies: dict[int, int] = {}
+    with ThreadPoolExecutor(max_workers=probe_workers) as executor:
+        future_map = {executor.submit(check, ep["server"], ep["server_port"]): index
+                      for index, (_, _, _, ep) in enumerate(pool)}
+        for future in future_map:
+            try:
+                latencies[future_map[future]] = future.result()
+            except Exception:
+                latencies[future_map[future]] = 0
+
+    alive = [(latencies[i], speed, country, short, ep)
+             for i, (speed, country, short, ep) in enumerate(pool)
+             if latencies.get(i, 0) > 0]
+    alive.sort(key=lambda item: item[0])
+    return [_node(speed, country, short, ep, latency)
+            for latency, speed, country, short, ep in alive[:limit]]
+
+
+def nodes_to_endpoints(nodes: list[dict], tag_prefix: str = "vpngate") -> list[dict]:
+    """Assign tags and return clean sing-box endpoint dicts (no metadata keys)."""
     endpoints = []
-    for index, (_, endpoint) in enumerate(candidates[:limit]):
+    for index, node in enumerate(nodes):
+        endpoint = dict(node["endpoint"])
         endpoint["tag"] = f"{tag_prefix}-{index}"
+        node["endpoint"] = endpoint
         endpoints.append(endpoint)
     return endpoints
+
+
+def snapshot_to_endpoints(
+    csv_text: str,
+    limit: int = 8,
+    tag_prefix: str = "vpngate",
+    username: str = DEFAULT_USERNAME,
+    password: str = DEFAULT_PASSWORD,
+    probe: bool = True,
+    probe_fn=None,
+    probe_timeout: int = 5,
+    probe_workers: int = 20,
+    probe_pool: int = 30,
+) -> list[dict]:
+    """Parse a VPNGate CSV snapshot into tagged sing-box endpoints.
+
+    Prefers nodes with a working TCP handshake, ranked by measured latency.
+    """
+    nodes = snapshot_to_nodes(
+        csv_text, limit=limit, probe=probe, probe_fn=probe_fn,
+        probe_timeout=probe_timeout, probe_workers=probe_workers,
+        probe_pool=probe_pool, username=username, password=password)
+    if not nodes:
+        raise ValueError("snapshot contains no reachable nodes")
+    return nodes_to_endpoints(nodes, tag_prefix)
 
 
 def build_singbox_config(
@@ -142,18 +245,26 @@ def build_singbox_config(
     mixed_listen: str | None = None,
     mixed_port: int | None = None,
     mixed_users: list[tuple[str, str]] | None = None,
+    final: str = "auto",
 ) -> dict:
-    """Wrap endpoints in a minimal checkable sing-box config."""
+    """Wrap endpoints in a minimal checkable sing-box config.
+
+    route.final defaults to the "auto" urltest group so traffic fails over
+    across healthy nodes automatically; pass an endpoint tag to pin one.
+    The urltest group always contains "direct" as a last-resort outlet so
+    a total VPNGate outage degrades to direct instead of blackholing.
+    """
     tags = [ep["tag"] for ep in endpoints]
     config: dict = {
         "log": {"level": "info"},
         "endpoints": endpoints,
         "outbounds": [
             {"type": "selector", "tag": "proxy", "outbounds": tags + ["direct"]},
-            {"type": "urltest", "tag": "auto", "outbounds": tags, "interval": "5m", "tolerance": 300},
+            {"type": "urltest", "tag": "auto", "outbounds": tags + ["direct"],
+             "interval": "1m", "tolerance": 800},
             {"type": "direct", "tag": "direct"},
         ],
-        "route": {"final": "proxy", "auto_detect_interface": True},
+        "route": {"final": final, "auto_detect_interface": True},
     }
     if mixed_listen is not None and mixed_port is not None:
         inbound: dict = {"type": "mixed", "tag": "mixed-in",
@@ -173,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, help="output sing-box JSON file")
     parser.add_argument("--tag", default="vpngate-0", help="endpoint tag (--input) or prefix (--csv)")
     parser.add_argument("--limit", type=int, default=8, help="max endpoints for --csv mode")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="skip TCP handshake probing, rank by Speed instead")
     parser.add_argument("--mixed", default=None, help="optional mixed inbound HOST:PORT for dial tests")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
@@ -189,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         endpoints = snapshot_to_endpoints(
             csv_text, limit=args.limit, tag_prefix=args.tag,
             username=args.username, password=args.password,
+            probe=not args.no_probe,
         )
         Path(args.output).write_text(
             json.dumps(build_singbox_config(endpoints, mixed_listen, mixed_port), indent=2) + "\n",
