@@ -1,0 +1,21 @@
+# Railway image: python multiplexer + sing-box (no TUN / no privileges needed).
+FROM python:3.11-slim
+
+ARG SINGBOX_VERSION=1.14.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -Ls "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz" \
+        | tar xz -C /tmp \
+    && mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \
+    && chmod +x /usr/local/bin/sing-box \
+    && sing-box version \
+    && rm -rf /tmp/sing-box-* /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY vpngate_to_singbox.py railway_manager.py ./
+COPY scripts/ ./scripts/
+
+# NOTE: Railway injects $PORT at runtime; shell form is required so it expands.
+# The manager also serves /healthz (Railway healthcheck) on the same port.
+CMD sh -c "exec python railway_manager.py"

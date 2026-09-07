@@ -209,3 +209,32 @@ jobs:
       - name: Summarize and gate
         run: |
           python scripts/summarize_probe.py --input /tmp/probe.jsonl --summary-file "$GITHUB_STEP_SUMMARY"
+
+  railway-build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build railway image
+        run: docker build -f Dockerfile.railway -t vpngate-railway:test .
+      - name: Smoke test (boot + routes, no TUN)
+        run: |
+          docker run -d --name vpngate-test -p 8080:8080 \
+            -e PORT=8080 -e PROXY_USER=u -e PROXY_PASS=test-pass \
+            vpngate-railway:test
+          for i in $(seq 1 12); do
+            if curl -m 5 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"; then
+              echo "healthz OK after ~$((i * 10))s"
+              break
+            fi
+            sleep 10
+          done
+          curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"
+          curl -m 10 -s http://127.0.0.1:8080/ui | grep -q "api/status"
+          curl -m 10 -s http://127.0.0.1:8080/api/status | python3 -m json.tool
+          echo "--- container log tail ---"
+          docker logs vpngate-test 2>&1 | tail -n 10
+      - name: Cleanup
+        if: always()
+        run: docker rm -f vpngate-test || true

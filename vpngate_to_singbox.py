@@ -141,6 +141,7 @@ def build_singbox_config(
     endpoints: list[dict],
     mixed_listen: str | None = None,
     mixed_port: int | None = None,
+    mixed_users: list[tuple[str, str]] | None = None,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config."""
     tags = [ep["tag"] for ep in endpoints]
@@ -155,9 +156,12 @@ def build_singbox_config(
         "route": {"final": "proxy", "auto_detect_interface": True},
     }
     if mixed_listen is not None and mixed_port is not None:
-        config["inbounds"] = [
-            {"type": "mixed", "tag": "mixed-in", "listen": mixed_listen, "listen_port": mixed_port},
-        ]
+        inbound: dict = {"type": "mixed", "tag": "mixed-in",
+                         "listen": mixed_listen, "listen_port": mixed_port}
+        if mixed_users:
+            inbound["users"] = [{"username": user, "password": password}
+                                for user, password in mixed_users]
+        config["inbounds"] = [inbound]
     return config
 
 
