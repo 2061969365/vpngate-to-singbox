@@ -125,7 +125,7 @@ jobs:
           sing-box version
           python - <<'EOF'
           import json
-          from vpngate_to_singbox import snapshot_to_nodes
+          from vpngate_to_singbox import nodes_to_endpoints, snapshot_to_nodes
           nodes = snapshot_to_nodes(open("/tmp/vpngate.csv", encoding="utf-8").read(),
                                     limit=8, real_topk=4, dial_timeout=90)
           for n in nodes[:8]:
@@ -134,7 +134,7 @@ jobs:
           measured = [n for n in nodes if n.get("real_latency_ms") is not None]
           print(f"ranking done: {len(measured)}/{len(nodes)} yielded real latency")
           assert measured, "no fresh node yielded real tunnel latency"
-          json.dump([n["endpoint"] for n in nodes],
+          json.dump(nodes_to_endpoints(nodes, "vpngate"),
                     open("/tmp/all_eps.json", "w"), indent=2)
           print("MEASURE OK: fresh-node real-latency gate passed")
           EOF
@@ -147,6 +147,7 @@ jobs:
           from vpngate_to_singbox import build_singbox_config
           eps = json.load(open("/tmp/all_eps.json"))[4:7]
           assert eps, "need at least 1 disjoint endpoint for the dial step"
+          assert all(e.get("tag") for e in eps), "endpoint tags must not be blank"
           cfg = build_singbox_config(eps, "127.0.0.1", 18080)
           json.dump(cfg, open("/tmp/singbox-dial.json", "w"), indent=2)
           print("dial candidates:", [(e["server"], e["server_port"]) for e in eps])
