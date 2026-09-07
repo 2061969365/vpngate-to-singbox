@@ -204,6 +204,26 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual([{"tag": "old"}], manager.status["endpoints"])
         self.assertIn("network down", manager.status["last_error"])
 
+    def test_first_seen_pruned_to_current_nodes(self) -> None:
+        manager = self._manager()
+        manager._first_seen = {
+            "203.0.113.11:443": "2020-01-01T00:00:00Z",  # still present: keep stamp
+            "198.51.100.99:443": "2020-01-01T00:00:00Z",  # vanished: prune
+        }
+        try:
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100):
+                ok = manager.refresh_once(
+                    fetcher=lambda url, timeout: _snapshot_csv("203.0.113.11", "203.0.113.12"))
+        finally:
+            manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual("2020-01-01T00:00:00Z",
+                         manager._first_seen.get("203.0.113.11:443"))
+        self.assertNotIn("198.51.100.99:443", manager._first_seen)
+        self.assertIn("203.0.113.12:443", manager._first_seen)
+
 
 class AuthTests(unittest.TestCase):
     TOKEN = "test-admin-token-0123456789abcdef"
@@ -285,6 +305,16 @@ class EnvValidationTests(unittest.TestCase):
 
         self.assertEqual(8080, config["port"])
         self.assertEqual("0123456789abcdef", config["password"])
+
+    def test_data_dir_defaults_to_cwd(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(".", config["data_dir"])
+
+    def test_data_dir_passthrough(self) -> None:
+        config = build_config_from_env(self._env(DATA_DIR="/data"))
+
+        self.assertEqual("/data", config["data_dir"])
 
     def test_default_fetch_rejects_plain_http(self) -> None:
         with self.assertRaises(ValueError):

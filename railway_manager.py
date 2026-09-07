@@ -163,6 +163,7 @@ def build_config_from_env(env: dict) -> dict:
         "snapshot_url": snapshot_url,
         "refresh_seconds": int(env.get("REFRESH_SECONDS", "1200")),
         "limit": int(env.get("LIMIT", "8")),
+        "data_dir": env.get("DATA_DIR", "."),
     }
 
 
@@ -711,9 +712,13 @@ class RailwayManager:
         with self._lock:
             old_seen = dict(self._first_seen)
             now = _now_iso()
+            current_keys = set()
             for node in nodes:
                 key = f"{node['server']}:{node['server_port']}"
+                current_keys.add(key)
                 self._first_seen.setdefault(key, old_seen.get(key, now))
+            for key in [k for k in self._first_seen if k not in current_keys]:
+                del self._first_seen[key]
             self._nodes = nodes
             endpoints = nodes_to_endpoints(nodes)
             if self.preferred_tag not in {ep["tag"] for ep in endpoints}:
@@ -841,6 +846,8 @@ def main() -> int:
     if cfg["admin_token_generated"]:
         print(f"generated ADMIN_TOKEN={cfg['admin_token']} (save it to use /ui and /api)",
               flush=True)
+    data_dir = cfg["data_dir"]
+    os.makedirs(data_dir, exist_ok=True)
     manager = RailwayManager(
         port=cfg["port"],
         mixed_port=cfg["mixed_port"],
@@ -850,6 +857,9 @@ def main() -> int:
         snapshot_url=cfg["snapshot_url"],
         refresh_seconds=cfg["refresh_seconds"],
         limit=cfg["limit"],
+        config_path=os.path.join(data_dir, "singbox-railway.json"),
+        nodes_path=os.path.join(data_dir, "nodes.json"),
+        state_path=os.path.join(data_dir, "state.json"),
     )
     stop_event = threading.Event()
 

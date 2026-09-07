@@ -54,6 +54,9 @@ TCP 复检，连续 3 次不通自动解 pin 回 `auto`。
    对应的内部端口 → 得到 `xxx.proxy.rlwy.net:随机端口`，SOCKS5 客户端连这里
    （用户名/密码 = `PROXY_USER`/`PROXY_PASS`）。
 6. 健康检查：`railway.toml` 已配 `/healthz`，失败自动重启（最多 10 次）。
+7. 持久化（建议）：挂一个 Volume 到 `/data`，并设 `DATA_DIR=/data`。
+   运行时文件（`singbox-railway.json`、`nodes.json`、`state.json`、上次可用配置）
+   默认落工作目录，重部署即丢；指向 volume 后重启/重部署可秒恢复旧节点。
 
 ### 环境变量
 
@@ -66,6 +69,7 @@ TCP 复检，连续 3 次不通自动解 pin 回 `auto`。
 | `SNAPSHOT_URL` | VPNGate 官方 API | 快照源，必须是 `https` |
 | `REFRESH_SECONDS` | `1200` | 快照刷新间隔（连续失败自动减半加速恢复，最低 300s） |
 | `LIMIT` | `8` | 每次取 Top N 个握得通的 TCP 节点（实测延迟排序） |
+| `DATA_DIR` | `.` | 运行时文件目录；Railway 挂 volume 到 `/data` 时设为 `/data` |
 
 ### API（均需 `Authorization: Bearer $ADMIN_TOKEN`，`/healthz` 除外）
 
