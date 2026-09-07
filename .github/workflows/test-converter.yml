@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Compile sources
-        run: python -m py_compile vpngate_to_singbox.py
+        run: python -m py_compile vpngate_to_singbox.py scripts/summarize_probe.py
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: CLI smoke test on sample ovpn
@@ -141,3 +141,71 @@ jobs:
           pkill -f singbox-try || true
           echo "all dial attempts failed"
           exit 1
+
+  live-stability:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Fetch real VPNGate snapshot
+        run: |
+          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
+            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+          python vpngate_to_singbox.py --csv /tmp/vpngate.csv \
+            --limit 3 --output /tmp/singbox-stab.json --tag vpngate \
+            --mixed 127.0.0.1:18080
+      - name: Download sing-box v1.14.0
+        run: |
+          curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
+          ./sing-box-*/sing-box check -c /tmp/singbox-stab.json
+      - name: Probe stability (6x latency + 10MB download per endpoint)
+        run: |
+          : > /tmp/probe.jsonl
+          record() { python3 - "$@" <<'EOF'
+          import json, sys
+          rec = {"endpoint": sys.argv[1], "kind": sys.argv[2], "ok": sys.argv[3] == "1",
+                 "seconds": float(sys.argv[4]), "mbps": float(sys.argv[5]) if len(sys.argv) > 5 else 0.0}
+          open("/tmp/probe.jsonl", "a").write(json.dumps(rec) + "\n")
+          print(rec, flush=True)
+          EOF
+          }
+          for i in 0 1 2; do
+            pkill -f singbox-stab || true
+            python3 - "$i" <<'EOF'
+          import json, sys
+          cfg = json.load(open("/tmp/singbox-stab.json"))
+          cfg["route"]["final"] = "vpngate-" + sys.argv[1]
+          json.dump(cfg, open("/tmp/singbox-stab-try.json", "w"), indent=2)
+          print("probing endpoint vpngate-" + sys.argv[1], flush=True)
+          EOF
+            ./sing-box-*/sing-box run -c /tmp/singbox-stab-try.json > /tmp/singbox-stab.log 2>&1 &
+            sleep 25
+            for r in 1 2 3 4 5 6; do
+              if out=$(curl -m 20 -s -o /dev/null -x socks5h://127.0.0.1:18080 \
+                  -w "%{http_code} %{time_total}" https://www.gstatic.com/generate_204); then
+                set -- $out
+                if [ "$1" = "204" ]; then record "vpngate-$i" latency 1 "$2"; else record "vpngate-$i" latency 0 "$2"; fi
+              else
+                record "vpngate-$i" latency 0 0
+              fi
+              sleep 8
+            done
+            if out=$(curl -m 90 -s -o /dev/null -x socks5h://127.0.0.1:18080 \
+                -w "%{http_code} %{time_total} %{size_download}" "https://speed.cloudflare.com/__down?bytes=10000000"); then
+              set -- $out
+              mbps=$(python3 -c "print(round($3*8/float($2)/1e6, 2) if float($2) > 0 else 0)")
+              if [ "$1" = "200" ] && [ "$3" != "0" ]; then record "vpngate-$i" speed 1 "$2" "$mbps"; else record "vpngate-$i" speed 0 "$2" 0; fi
+            else
+              record "vpngate-$i" speed 0 0 0
+            fi
+          done
+          pkill -f singbox-stab || true
+          echo "--- probe.jsonl ---"
+          cat /tmp/probe.jsonl
+      - name: Summarize and gate
+        run: |
+          python scripts/summarize_probe.py --input /tmp/probe.jsonl --summary-file "$GITHUB_STEP_SUMMARY"
