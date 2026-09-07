@@ -172,6 +172,10 @@ jobs:
           exit 1
       - name: Validate measure_real_latency on known-good node
         run: |
+          # Let the volunteer server's session from the old-style dial above
+          # clear first; back-to-back dials warm up pathologically slowly.
+          echo "waiting 60s for the server-side session to release..."
+          sleep 60
           export PATH="$PWD/sing-box-1.14.0-linux-amd64:$PATH"
           python - <<'EOF'
           import json

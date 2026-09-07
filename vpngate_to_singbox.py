@@ -274,12 +274,11 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     "127.0.0.1", port, target_host, target_port, path,
                     timeout=min(10, max(1, remaining)))
                 if first is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return first
-                    return _socks5_get_latency_ms(
-                        "127.0.0.1", port, target_host, target_port, path,
-                        timeout=min(30, max(1, remaining)))
+                    # The readiness probe already completed a full HTTPS GET
+                    # through the tunnel; return it directly. A second timed
+                    # GET would only re-race a shrinking deadline (e.g. a 2s
+                    # budget when readiness arrives at 118s of 120s).
+                    return first
                 if proc.poll() is not None:
                     break  # sing-box died; the tunnel will never come up
                 time.sleep(poll_interval)

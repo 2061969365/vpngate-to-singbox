@@ -518,6 +518,27 @@ class MeasureDiagnosticsTests(unittest.TestCase):
         self.assertLess(elapsed, 15)
 
 
+class MeasureReturnFirstTests(unittest.TestCase):
+    def test_first_successful_get_is_returned_without_second_call(self) -> None:
+        from unittest import mock
+        from vpngate_to_singbox import measure_real_latency, ovpn_to_endpoint
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="probe-0")
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        with mock.patch("vpngate_to_singbox.subprocess.Popen",
+                        return_value=fake_proc), \
+             mock.patch("vpngate_to_singbox._socks5_get_latency_ms",
+                        side_effect=[118, None]) as probe:
+            result = measure_real_latency(endpoint, timeout=60, poll_interval=1)
+
+        # The readiness probe already completed a full HTTPS GET through the
+        # tunnel; a second timed GET only adds failure surface (e.g. a 2s
+        # budget when readiness arrives at 118s of a 120s deadline).
+        self.assertEqual(118, result)
+        self.assertEqual(1, probe.call_count)
+
+
 class DialProbeConfigTests(unittest.TestCase):
     def test_final_pinned_to_probe_tag(self) -> None:
         from vpngate_to_singbox import _dial_probe_config
