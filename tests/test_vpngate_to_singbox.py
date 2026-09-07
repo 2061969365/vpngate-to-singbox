@@ -1,8 +1,10 @@
 """Tests for minimal VPNGate .ovpn -> sing-box openvpn-client converter."""
 import base64
 import socket
+import ssl
 import threading
 import unittest
+from pathlib import Path
 
 from vpngate_to_singbox import (
     build_singbox_config,
@@ -12,6 +14,10 @@ from vpngate_to_singbox import (
     snapshot_to_endpoints,
     snapshot_to_nodes,
 )
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+TLS_CERT = str(FIXTURE_DIR / "tls-localhost.crt")
+TLS_KEY = str(FIXTURE_DIR / "tls-localhost.key")
 
 
 TCP_OVPN = """\
@@ -271,10 +277,12 @@ class SnapshotToEndpointsTests(unittest.TestCase):
 
 
 class FakeSocks5Server:
-    """Minimal SOCKS5 server: no-auth + CONNECT success + fixed HTTP status."""
+    """SOCKS5 server: no-auth + CONNECT, then TLS (like a real 443 target)."""
 
     def __init__(self, status_code: int = 204) -> None:
         self.status_code = status_code
+        self._tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._tls_context.load_cert_chain(TLS_CERT, TLS_KEY)
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("127.0.0.1", 0))
@@ -325,6 +333,11 @@ class FakeSocks5Server:
                     conn.close()
                     continue
                 conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                try:
+                    conn = self._tls_context.wrap_socket(conn, server_side=True)
+                except OSError:
+                    conn.close()
+                    continue
                 request = b""
                 while b"\r\n\r\n" not in request:
                     chunk = conn.recv(4096)
@@ -351,7 +364,9 @@ class Socks5LatencyTests(unittest.TestCase):
         server = FakeSocks5Server(status_code=204)
         server.start()
         try:
-            latency = _socks5_get_latency_ms("127.0.0.1", server.port, timeout=5)
+            latency = _socks5_get_latency_ms(
+                "127.0.0.1", server.port, target_host="127.0.0.1",
+                target_port=server.port, timeout=5, cafile=TLS_CERT)
         finally:
             server.stop()
 
@@ -364,7 +379,9 @@ class Socks5LatencyTests(unittest.TestCase):
         server = FakeSocks5Server(status_code=500)
         server.start()
         try:
-            latency = _socks5_get_latency_ms("127.0.0.1", server.port, timeout=5)
+            latency = _socks5_get_latency_ms(
+                "127.0.0.1", server.port, target_host="127.0.0.1",
+                target_port=server.port, timeout=5, cafile=TLS_CERT)
         finally:
             server.stop()
 

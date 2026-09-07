@@ -8,6 +8,7 @@ import io
 import json
 import re
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -137,8 +138,13 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
                            target_host: str = "www.gstatic.com",
                            target_port: int = 443,
                            path: str = "/generate_204",
-                           timeout: float = 20) -> int | None:
-    """One HTTPS GET through a SOCKS5 proxy; ms on HTTP 204, else None."""
+                           timeout: float = 20,
+                           cafile: str | None = None) -> int | None:
+    """One HTTPS GET through a SOCKS5 proxy; ms on HTTP 204, else None.
+
+    The GET goes through a real TLS handshake (SNI=target_host), so the
+    measured latency matches what curl reports (TCP+TLS+HTTP).
+    """
     family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
     sock = None
     try:
@@ -169,6 +175,12 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
         elif atyp == 4:
             _recv_exact(sock, 18)
         else:
+            return None
+        try:
+            context = (ssl.create_default_context(cafile=cafile) if cafile
+                       else ssl.create_default_context())
+            sock = context.wrap_socket(sock, server_hostname=target_host)
+        except OSError:
             return None
         start = time.monotonic()
         sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {target_host}\r\n"
