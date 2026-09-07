@@ -207,6 +207,18 @@ def _free_port() -> int:
         sock.close()
 
 
+def _log_dial_failure(endpoint: dict, err_path: str) -> None:
+    """Print the sing-box stderr tail so CI logs show why a dial failed."""
+    try:
+        with open(err_path, "rb") as handle:
+            tail = handle.read()[-2048:].decode("utf-8", errors="replace").strip()
+    except OSError:
+        tail = ""
+    detail = f"\nsing-box log tail:\n{tail}" if tail else " (no sing-box log captured)"
+    print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}{detail}",
+          flush=True)
+
+
 def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                          timeout: int = 90, poll_interval: int = 2,
                          target_host: str = "www.gstatic.com",
@@ -222,11 +234,24 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
     try:
         cfg_path = str(Path(tmpdir.name) / "dial.json")
         Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
+        err_path = str(Path(tmpdir.name) / "dial-stderr.log")
+        try:
+            err_handle = open(err_path, "ab")
+        except OSError:
+            err_handle = None
         try:
             proc = subprocess.Popen(
                 [singbox_bin, "run", "-c", cfg_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL,
+                stderr=err_handle or subprocess.DEVNULL)
         except OSError:
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
+                  f"cannot start {singbox_bin}", flush=True)
             return None
         try:
             deadline = time.monotonic() + timeout
@@ -242,7 +267,15 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     return _socks5_get_latency_ms(
                         "127.0.0.1", port, target_host, target_port, path,
                         timeout=min(30, max(1, remaining)))
+                if proc.poll() is not None:
+                    break  # sing-box died; the tunnel will never come up
                 time.sleep(poll_interval)
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            _log_dial_failure(endpoint, err_path)
             return None
         finally:
             try:
@@ -251,6 +284,11 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
             except (OSError, subprocess.TimeoutExpired):
                 try:
                     proc.kill()
+                except OSError:
+                    pass
+            if err_handle is not None:
+                try:
+                    err_handle.close()
                 except OSError:
                     pass
     finally:

@@ -6,6 +6,8 @@ import os
 import socket
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -568,6 +570,110 @@ class PinnedHealthTests(unittest.TestCase):
                     self.assertEqual("pinned", manager.check_pinned_health(probe_fn=healthy))
 
                 self.assertEqual("vpngate-0", manager.preferred_tag)
+            finally:
+                manager.stop()
+
+
+class StartOrderTests(unittest.TestCase):
+    TOKEN = "0123456789abcdef-start-order"
+
+    def _get(self, port: int, path: str) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        with sock:
+            sock.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        return response
+
+    def test_listener_up_while_initial_refresh_blocked(self) -> None:
+        gate = threading.Event()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            def blocking_fetch(url, timeout):
+                gate.wait(30)
+                return _snapshot_csv("203.0.113.11")
+
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(), admin_token=self.TOKEN,
+                start_singbox=False, auto_refresh=False, fetch_on_start=True,
+                config_path=f"{tmpdir}/singbox.json",
+                nodes_path=f"{tmpdir}/nodes.json",
+                state_path=f"{tmpdir}/state.json",
+                fetcher=blocking_fetch)
+            started = time.monotonic()
+            port = manager.start()
+            try:
+                # start() must return while the first refresh is still blocked
+                self.assertLess(time.monotonic() - started, 5)
+                with mock.patch.object(RailwayManager, "_check_config",
+                                       return_value=True):
+                    with mock.patch("railway_manager.probe_tcp_latency",
+                                      return_value=100):
+                        # listener already accepts: 503, no endpoints yet
+                        self.assertIn(b"503", self._get(port, "/healthz"))
+                        gate.set()
+                        deadline = time.monotonic() + 15
+                        while (manager.status["last_refresh"] is None
+                               and time.monotonic() < deadline):
+                            time.sleep(0.2)
+                        self.assertIsNotNone(manager.status["last_refresh"])
+            finally:
+                gate.set()
+                manager.stop()
+
+
+class SwitchRealLatencyTests(unittest.TestCase):
+    TOKEN = "0123456789abcdef-switch-real"
+
+    def _manager(self, tmpdir: str, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), admin_token=self.TOKEN,
+                        start_singbox=True, auto_refresh=False, fetch_on_start=False,
+                        config_path=f"{tmpdir}/singbox.json",
+                        nodes_path=f"{tmpdir}/nodes.json",
+                        state_path=f"{tmpdir}/state.json",
+                        fetcher=lambda url, timeout: _snapshot_csv("203.0.113.11",
+                                                                   "203.0.113.12"))
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def _post(self, port: int, path: str, body: bytes) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        with sock:
+            headers = (f"POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n"
+                       f"Authorization: Bearer {self.TOKEN}\r\n"
+                       f"Content-Length: {len(body)}\r\n")
+            sock.sendall(headers.encode() + b"\r\n" + body)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        return response
+
+    def test_switch_by_country_prefers_real_latency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # handshake winner is .11, but real tunnel latency winner is .12
+            dial = lambda node: {"203.0.113.11": 800, "203.0.113.12": 50}[node["server"]]
+            manager = self._manager(tmpdir, real_topk=2, dial_fn=dial)
+            port = manager.start()
+            try:
+                with _fake_singbox():
+                    with mock.patch(
+                            "railway_manager.probe_tcp_latency",
+                            side_effect=lambda h, p, timeout=5: (
+                                100 if h == "203.0.113.11" else 900)):
+                        self.assertTrue(manager.refresh_once())
+                    tag12 = next(e["tag"] for e in manager.status["endpoints"]
+                                 if e["server"] == "203.0.113.12")
+                    body = json.dumps({"country": "JP"}).encode()
+                    response = self._post(port, "/api/switch", body)
+
+                self.assertIn(b"200 OK", response)
+                self.assertEqual(tag12, manager.preferred_tag)
             finally:
                 manager.stop()
 

@@ -278,9 +278,8 @@ class RailwayManager:
 
     # -- lifecycle ------------------------------------------------------
     def start(self) -> int:
-        if self.fetch_on_start:
-            if not self.refresh_once():
-                self._boot_from_last_good()
+        # Bind first so $PORT (and /healthz) answers immediately; the first
+        # snapshot refresh — which may dial several tunnels — runs behind.
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("0.0.0.0", self.port))
@@ -293,9 +292,15 @@ class RailwayManager:
             threading.Thread(target=self._refresh_loop, daemon=True).start()
         threading.Thread(target=self._supervise_loop, daemon=True).start()
         threading.Thread(target=self._health_monitor_loop, daemon=True).start()
+        if self.fetch_on_start:
+            threading.Thread(target=self._initial_refresh, daemon=True).start()
         print(f"listening on 0.0.0.0:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}",
               flush=True)
         return self.bound_port
+
+    def _initial_refresh(self) -> None:
+        if not self.refresh_once():
+            self._boot_from_last_good()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -645,7 +650,10 @@ class RailwayManager:
                 if not candidates:
                     return False, f"no nodes for country {country}"
                 candidates.sort(key=lambda n: (
-                    n.get("latency_ms") if n.get("latency_ms") is not None else 10 ** 9,
+                    (0, n["real_latency_ms"])
+                    if n.get("real_latency_ms") is not None
+                    else (1, n.get("latency_ms")
+                          if n.get("latency_ms") is not None else 10 ** 9),
                     -(n.get("speed") or 0)))
                 node = candidates[0]
             elif tag in (None, "", "auto"):

@@ -126,7 +126,7 @@ jobs:
           python - <<'EOF'
           from vpngate_to_singbox import snapshot_to_nodes
           nodes = snapshot_to_nodes(open("/tmp/vpngate.csv", encoding="utf-8").read(),
-                                    limit=5, real_topk=2, dial_timeout=90)
+                                    limit=8, real_topk=4, dial_timeout=90)
           for n in nodes[:5]:
               print(n["server"], n["server_port"], "handshake=", n["latency_ms"],
                     "real=", n.get("real_latency_ms"), n.get("country_short"))

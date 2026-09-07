@@ -500,5 +500,23 @@ class MixedInboundTests(unittest.TestCase):
         self.assertNotIn("inbounds", cfg)
 
 
+class MeasureDiagnosticsTests(unittest.TestCase):
+    def test_dead_binary_returns_none_without_waiting_full_timeout(self) -> None:
+        import sys
+        import time
+        from vpngate_to_singbox import measure_real_latency, ovpn_to_endpoint
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="probe-0")
+        started = time.monotonic()
+        # python exits immediately on a bad script name: process dies fast,
+        # so measure must give up early instead of polling until deadline.
+        result = measure_real_latency(endpoint, singbox_bin=sys.executable,
+                                      timeout=30, poll_interval=1)
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 15)
+
+
 if __name__ == "__main__":
     unittest.main()
