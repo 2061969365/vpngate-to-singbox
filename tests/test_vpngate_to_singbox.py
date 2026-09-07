@@ -124,5 +124,27 @@ class SnapshotToEndpointsTests(unittest.TestCase):
             snapshot_to_endpoints(csv_text)
 
 
+class MixedInboundTests(unittest.TestCase):
+    def test_mixed_inbound_included_when_requested(self) -> None:
+        from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+        cfg = build_singbox_config([endpoint], mixed_listen="127.0.0.1", mixed_port=18080)
+
+        inbounds = cfg.get("inbounds", [])
+        self.assertEqual(1, len(inbounds))
+        self.assertEqual("mixed", inbounds[0]["type"])
+        self.assertEqual("127.0.0.1", inbounds[0]["listen"])
+        self.assertEqual(18080, inbounds[0]["listen_port"])
+
+    def test_no_inbound_by_default(self) -> None:
+        from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+        cfg = build_singbox_config([endpoint])
+
+        self.assertNotIn("inbounds", cfg)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -137,10 +137,14 @@ def snapshot_to_endpoints(
     return endpoints
 
 
-def build_singbox_config(endpoints: list[dict]) -> dict:
+def build_singbox_config(
+    endpoints: list[dict],
+    mixed_listen: str | None = None,
+    mixed_port: int | None = None,
+) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config."""
     tags = [ep["tag"] for ep in endpoints]
-    return {
+    config: dict = {
         "log": {"level": "info"},
         "endpoints": endpoints,
         "outbounds": [
@@ -150,6 +154,11 @@ def build_singbox_config(endpoints: list[dict]) -> dict:
         ],
         "route": {"final": "proxy", "auto_detect_interface": True},
     }
+    if mixed_listen is not None and mixed_port is not None:
+        config["inbounds"] = [
+            {"type": "mixed", "tag": "mixed-in", "listen": mixed_listen, "listen_port": mixed_port},
+        ]
+    return config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,9 +169,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, help="output sing-box JSON file")
     parser.add_argument("--tag", default="vpngate-0", help="endpoint tag (--input) or prefix (--csv)")
     parser.add_argument("--limit", type=int, default=8, help="max endpoints for --csv mode")
+    parser.add_argument("--mixed", default=None, help="optional mixed inbound HOST:PORT for dial tests")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
     args = parser.parse_args(argv)
+
+    mixed_listen: str | None = None
+    mixed_port: int | None = None
+    if args.mixed:
+        mixed_listen, _, mixed_port_str = args.mixed.rpartition(":")
+        mixed_port = int(mixed_port_str)
 
     if args.csv:
         csv_text = Path(args.csv).read_text(encoding="utf-8")
@@ -170,13 +186,19 @@ def main(argv: list[str] | None = None) -> int:
             csv_text, limit=args.limit, tag_prefix=args.tag,
             username=args.username, password=args.password,
         )
-        Path(args.output).write_text(json.dumps(build_singbox_config(endpoints), indent=2) + "\n", encoding="utf-8")
+        Path(args.output).write_text(
+            json.dumps(build_singbox_config(endpoints, mixed_listen, mixed_port), indent=2) + "\n",
+            encoding="utf-8",
+        )
         print(f"wrote {args.output} with {len(endpoints)} endpoints")
         return 0
 
     config_text = Path(args.input).read_text(encoding="utf-8")
     endpoint = ovpn_to_endpoint(config_text, tag=args.tag, username=args.username, password=args.password)
-    Path(args.output).write_text(json.dumps(build_singbox_config([endpoint]), indent=2) + "\n", encoding="utf-8")
+    Path(args.output).write_text(
+        json.dumps(build_singbox_config([endpoint], mixed_listen, mixed_port), indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"wrote {args.output} with 1 endpoint ({endpoint['server']}:{endpoint['server_port']})")
     return 0
 

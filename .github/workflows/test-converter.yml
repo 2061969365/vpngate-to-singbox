@@ -88,3 +88,56 @@ jobs:
           curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
       - name: Validate live config with sing-box check
         run: ./sing-box-*/sing-box check -c /tmp/singbox-live.json
+
+  live-dial:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Fetch real VPNGate snapshot
+        run: |
+          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
+            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+      - name: Convert top TCP nodes with mixed inbound
+        run: |
+          python vpngate_to_singbox.py --csv /tmp/vpngate.csv \
+            --limit 3 --output /tmp/singbox-dial.json --tag vpngate \
+            --mixed 127.0.0.1:18080
+      - name: Download sing-box v1.14.0
+        run: |
+          curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
+          ./sing-box-*/sing-box check -c /tmp/singbox-dial.json
+      - name: Dial through VPNGate and verify exit IP
+        run: |
+          DIRECT_IP=$(curl -m 20 -s https://api.ipify.org)
+          echo "runner direct IP: $DIRECT_IP"
+          for i in 0 1 2; do
+            pkill -f singbox-try || true
+            python - "$i" <<'EOF'
+          import json, sys
+          i = sys.argv[1]
+          cfg = json.load(open("/tmp/singbox-dial.json"))
+          cfg["route"]["final"] = f"vpngate-{i}"
+          json.dump(cfg, open("/tmp/singbox-try.json", "w"), indent=2)
+          print("trying endpoint vpngate-" + i)
+          EOF
+            ./sing-box-*/sing-box run -c /tmp/singbox-try.json > /tmp/singbox-run.log 2>&1 &
+            sleep 25
+            if EXIT_IP=$(curl -m 60 -s -x socks5h://127.0.0.1:18080 https://api.ipify.org); then
+              echo "exit IP via vpngate-$i: $EXIT_IP"
+              if [ -n "$EXIT_IP" ] && [ "$EXIT_IP" != "$DIRECT_IP" ]; then
+                echo "DIAL OK: traffic exits via VPNGate, no TUN used"
+                pkill -f singbox-try || true
+                exit 0
+              fi
+            fi
+            echo "attempt vpngate-$i failed, see log tail:"
+            tail -n 20 /tmp/singbox-run.log || true
+          done
+          pkill -f singbox-try || true
+          echo "all dial attempts failed"
+          exit 1

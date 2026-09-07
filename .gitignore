@@ -3,4 +3,9 @@ __pycache__/
 out.json
 live_snapshot.csv
 live_singbox.json
+dial.json
+dial.log
+dial.err
+sing-box.zip
+sbtest/
 
