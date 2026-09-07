@@ -65,7 +65,7 @@ UI_HTML = """\
 <button onclick="refreshNow()">Refresh nodes</button>
 </div>
 <table border="1" cellpadding="6" id="nodes">
-<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th></tr>
+<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th><th>real</th></tr>
 </table>
 <p id="meta"></p>
 <script>
@@ -91,8 +91,8 @@ async function refresh() {
       s.countries.map(c => `<option value="${c.code}">${c.name} (${c.code})</option>`).join("");
     sel.value = cur;
     document.getElementById("nodes").innerHTML =
-      "<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th></tr>" +
-      s.endpoints.map(e => `<tr><td>${e.tag}${e.tag === s.preferred_tag ? " *pinned" : ""}</td><td>${e.country_short}</td><td>${e.server}</td><td>${e.server_port}</td><td>${e.latency_ms}ms</td></tr>`).join("");
+      "<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th><th>real</th></tr>" +
+      s.endpoints.map(e => `<tr><td>${e.tag}${e.tag === s.preferred_tag ? " *pinned" : ""}</td><td>${e.country_short}</td><td>${e.server}</td><td>${e.server_port}</td><td>${e.latency_ms}ms</td><td>${e.real_latency_ms == null ? "-" : e.real_latency_ms + "ms"}</td></tr>`).join("");
     document.getElementById("meta").textContent =
       `pinned: ${s.preferred_tag} | refresh ok/fail: ${s.refresh_ok}/${s.refresh_fail} | uptime: ${s.uptime_seconds}s | error: ${s.last_error}`;
   } catch (e) {
@@ -162,7 +162,8 @@ def build_config_from_env(env: dict) -> dict:
         "admin_token_generated": generated,
         "snapshot_url": snapshot_url,
         "refresh_seconds": int(env.get("REFRESH_SECONDS", "1200")),
-        "limit": int(env.get("LIMIT", "8")),
+        "limit": int(env.get("LIMIT", "0")),
+        "real_topk": int(env.get("REAL_TOPK", "5")),
         "data_dir": env.get("DATA_DIR", "."),
     }
 
@@ -215,7 +216,9 @@ class RailwayManager:
         admin_token: str | None = None,
         snapshot_url: str = DEFAULT_SNAPSHOT_URL,
         refresh_seconds: int = 1200,
-        limit: int = 8,
+        limit: int | None = 0,
+        real_topk: int = 0,
+        dial_fn=None,
         config_path: str = "singbox-railway.json",
         nodes_path: str = "nodes.json",
         state_path: str = "state.json",
@@ -234,6 +237,8 @@ class RailwayManager:
         self.snapshot_url = snapshot_url
         self.refresh_seconds = refresh_seconds
         self.limit = limit
+        self.real_topk = real_topk
+        self.dial_fn = dial_fn
         self.config_path = config_path
         self.nodes_path = nodes_path
         self.state_path = state_path
@@ -532,7 +537,8 @@ class RailwayManager:
             self.status["endpoints"] = [
                 {"tag": ep["tag"], "server": ep["server"], "server_port": ep["server_port"],
                  "country": n.get("country", ""), "country_short": n.get("country_short", ""),
-                 "latency_ms": n.get("latency_ms"), "speed": n.get("speed", 0)}
+                 "latency_ms": n.get("latency_ms"), "real_latency_ms": n.get("real_latency_ms"),
+                 "speed": n.get("speed", 0)}
                 for ep, n in zip(endpoints, nodes)]
             self.status["countries"] = self._countries()
             if preferred and preferred not in {ep["tag"] for ep in endpoints}:
@@ -704,7 +710,9 @@ class RailwayManager:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)
             nodes = snapshot_to_nodes(csv_text, limit=self.limit,
-                                      probe_fn=lambda h, p: probe_tcp_latency(h, p, 5))
+                                      probe_fn=lambda h, p: probe_tcp_latency(h, p, 5),
+                                      real_topk=self.real_topk, dial_fn=self.dial_fn,
+                                      singbox_bin=self.singbox_bin)
             if not nodes:
                 return self._refresh_failed("no reachable nodes, kept previous")
         except Exception as exc:
@@ -733,7 +741,8 @@ class RailwayManager:
             self.status["endpoints"] = [
                 {"tag": ep["tag"], "server": ep["server"], "server_port": ep["server_port"],
                  "country": n.get("country", ""), "country_short": n.get("country_short", ""),
-                 "latency_ms": n.get("latency_ms"), "speed": n.get("speed", 0)}
+                 "latency_ms": n.get("latency_ms"), "real_latency_ms": n.get("real_latency_ms"),
+                 "speed": n.get("speed", 0)}
                 for ep, n in zip(endpoints, nodes)]
             self.status["countries"] = self._countries()
             self.status["preferred_tag"] = self.preferred_tag
@@ -857,6 +866,7 @@ def main() -> int:
         snapshot_url=cfg["snapshot_url"],
         refresh_seconds=cfg["refresh_seconds"],
         limit=cfg["limit"],
+        real_topk=cfg["real_topk"],
         config_path=os.path.join(data_dir, "singbox-railway.json"),
         nodes_path=os.path.join(data_dir, "nodes.json"),
         state_path=os.path.join(data_dir, "state.json"),

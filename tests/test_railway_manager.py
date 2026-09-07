@@ -204,6 +204,33 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual([{"tag": "old"}], manager.status["endpoints"])
         self.assertIn("network down", manager.status["last_error"])
 
+    def test_refresh_passes_real_topk_and_reports_real_latency(self) -> None:
+        dialed: list[str] = []
+        real_by_server = {"203.0.113.12": 50}
+
+        def fake_dial(node):
+            dialed.append(node["server"])
+            return real_by_server.get(node["server"])
+
+        manager = self._manager(real_topk=2, dial_fn=fake_dial)
+        try:
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100):
+                ok = manager.refresh_once(
+                    fetcher=lambda url, timeout: _snapshot_csv(
+                        "203.0.113.11", "203.0.113.12", "203.0.113.13"))
+        finally:
+            manager.stop()
+
+        self.assertTrue(ok)
+        servers = [ep["server"] for ep in manager.status["endpoints"]]
+        reals = [ep["real_latency_ms"] for ep in manager.status["endpoints"]]
+        # handshake ties break by speed desc, so .13/.12 are dialed;
+        # measured .12 sorts first and tags follow final order
+        self.assertEqual({"203.0.113.13", "203.0.113.12"}, set(dialed))
+        self.assertEqual(["203.0.113.12", "203.0.113.13", "203.0.113.11"], servers)
+        self.assertEqual([50, None, None], reals)
+
     def test_first_seen_pruned_to_current_nodes(self) -> None:
         manager = self._manager()
         manager._first_seen = {
@@ -315,6 +342,16 @@ class EnvValidationTests(unittest.TestCase):
         config = build_config_from_env(self._env(DATA_DIR="/data"))
 
         self.assertEqual("/data", config["data_dir"])
+
+    def test_limit_defaults_to_all(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(0, config["limit"])
+
+    def test_real_topk_defaults_to_five(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(5, config["real_topk"])
 
     def test_default_fetch_rejects_plain_http(self) -> None:
         with self.assertRaises(ValueError):

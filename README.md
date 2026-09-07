@@ -12,8 +12,11 @@ VPNGate `.ovpn` (TCP) → sing-box `openvpn-client` endpoint 转换器，附带 
 ```bash
 # 单个 .ovpn
 python vpngate_to_singbox.py --input node.ovpn --output singbox.json --tag vpngate-0
-# 真实快照批量：只留 TCP 握得通的节点，按实测延迟排序取 Top N（带 --no-probe 则回退到按 Speed 排序）
-python vpngate_to_singbox.py --csv vpngate.csv --limit 8 --output singbox.json --tag vpngate
+# 真实快照批量：全量拉取，只留 TCP 握得通的节点，按实测延迟排序
+python vpngate_to_singbox.py --csv vpngate.csv --output singbox.json --tag vpngate
+# 限制数量 + 对 Top-K 做隧道内真实端到端延迟实测并优先排序
+python vpngate_to_singbox.py --csv vpngate.csv --limit 8 --real-topk 5 \
+  --output singbox.json --tag vpngate
 # 附带 mixed 入站（拨测用）
 python vpngate_to_singbox.py --csv vpngate.csv --limit 3 --output dial.json \
   --tag vpngate --mixed 127.0.0.1:18080
@@ -36,7 +39,8 @@ python vpngate_to_singbox.py --csv vpngate.csv --limit 3 --output dial.json \
 按国家下拉手动 `Switch`  pin 住某个节点。被 pin 的节点由健康监控每分钟
 TCP 复检，连续 3 次不通自动解 pin 回 `auto`。
 
-快照每 20 分钟（`REFRESH_SECONDS`）重拉：先实测 TCP 延迟过滤、只留握得通的；
+快照每 20 分钟（`REFRESH_SECONDS`）重拉：先实测 TCP 延迟过滤、只留握得通的，
+再对 Top-K（`REAL_TOPK`）做隧道内真实端到端延迟实测并优先排序；
 新配置先过 `sing-box check` 才原子落盘（`600` 权限）并重启，失败保旧；
 启动拉取失败则用上次可用配置 + 本地快照顶上。sing-box 异常退出按
 5/10/20/40/300s 退避自愈，连续 5 次等下一轮刷新。
@@ -47,7 +51,7 @@ TCP 复检，连续 3 次不通自动解 pin 回 `auto`。
 2. Region 建议选新加坡（离 VPNGate 亚洲节点近）。
 3. Variables：`PROXY_USER`、`PROXY_PASS`（≥16 位，弱口令直接拒绝启动）、
    `ADMIN_TOKEN`（留空则启动时随机生成并打印到日志，`/ui` 里填一次即可）、
-   可选 `LIMIT`（默认 8）。
+    可选 `LIMIT`（默认 `0` = 全量）、`REAL_TOPK`（默认 `5`，每次刷新实测隧道延迟的节点数）。
 4. 默认域名即 Web 入口：`https://<xxx>.up.railway.app/ui`（HTTP ingress 只放行标准 GET/POST，
    所以浏览器管理页走这里）。
 5. 再加一个 **TCP Proxy**（Service → Networking → TCP Proxy），目标端口填 `$PORT`
@@ -68,7 +72,8 @@ TCP 复检，连续 3 次不通自动解 pin 回 `auto`。
 | `ADMIN_TOKEN` | （随机生成） | `/ui` 与 `/api/*` 的 Bearer token，不足 16 位则自动生成并打印到日志 |
 | `SNAPSHOT_URL` | VPNGate 官方 API | 快照源，必须是 `https` |
 | `REFRESH_SECONDS` | `1200` | 快照刷新间隔（连续失败自动减半加速恢复，最低 300s） |
-| `LIMIT` | `8` | 每次取 Top N 个握得通的 TCP 节点（实测延迟排序） |
+| `LIMIT` | `0` | `0` = 全量拉取握得通的 TCP 节点；>0 则只留 Top N（实测延迟排序） |
+| `REAL_TOPK` | `5` | 每次刷新对握手最快的前 K 个节点做隧道内真实延迟实测并优先排序 |
 | `DATA_DIR` | `.` | 运行时文件目录；Railway 挂 volume 到 `/data` 时设为 `/data` |
 
 ### API（均需 `Authorization: Bearer $ADMIN_TOKEN`，`/healthz` 除外）

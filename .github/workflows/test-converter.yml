@@ -119,6 +119,21 @@ jobs:
         run: |
           curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
           ./sing-box-*/sing-box check -c /tmp/singbox-dial.json
+      - name: Real tunnel latency ranking (real_topk=2)
+        run: |
+          export PATH="$PWD/sing-box-1.14.0-linux-amd64:$PATH"
+          sing-box version
+          python - <<'EOF'
+          from vpngate_to_singbox import snapshot_to_nodes
+          nodes = snapshot_to_nodes(open("/tmp/vpngate.csv", encoding="utf-8").read(),
+                                    limit=5, real_topk=2, dial_timeout=90)
+          for n in nodes[:5]:
+              print(n["server"], n["server_port"], "handshake=", n["latency_ms"],
+                    "real=", n.get("real_latency_ms"), n.get("country_short"))
+          measured = [n for n in nodes if n.get("real_latency_ms") is not None]
+          assert measured, "no node yielded real tunnel latency"
+          print(f"REAL LATENCY OK: {len(measured)} node(s) measured")
+          EOF
       - name: Dial through VPNGate and verify exit IP
         run: |
           DIRECT_IP=$(curl -m 20 -s https://api.ipify.org)

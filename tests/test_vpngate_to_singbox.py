@@ -270,6 +270,214 @@ class SnapshotToEndpointsTests(unittest.TestCase):
             snapshot_to_endpoints(csv_text, probe=False)
 
 
+class FakeSocks5Server:
+    """Minimal SOCKS5 server: no-auth + CONNECT success + fixed HTTP status."""
+
+    def __init__(self, status_code: int = 204) -> None:
+        self.status_code = status_code
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self._listener.settimeout(5)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+
+    def _recvn(self, conn: socket.socket, size: int) -> bytes:
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                raise OSError("eof")
+            data += chunk
+        return data
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(5)
+                nmethods = self._recvn(conn, 2)[1]
+                self._recvn(conn, nmethods)
+                conn.sendall(b"\x05\x00")
+                header = self._recvn(conn, 4)
+                atyp = header[3]
+                if atyp == 1:
+                    self._recvn(conn, 6)
+                elif atyp == 3:
+                    self._recvn(conn, self._recvn(conn, 1)[0] + 2)
+                elif atyp == 4:
+                    self._recvn(conn, 18)
+                else:
+                    conn.close()
+                    continue
+                conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    request += chunk
+                conn.sendall(
+                    f"HTTP/1.1 {self.status_code} Test\r\nContent-Length: 0\r\n"
+                    f"Connection: close\r\n\r\n".encode()
+                )
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+
+class Socks5LatencyTests(unittest.TestCase):
+    def test_204_returns_positive_ms(self) -> None:
+        from vpngate_to_singbox import _socks5_get_latency_ms
+
+        server = FakeSocks5Server(status_code=204)
+        server.start()
+        try:
+            latency = _socks5_get_latency_ms("127.0.0.1", server.port, timeout=5)
+        finally:
+            server.stop()
+
+        self.assertIsNotNone(latency)
+        self.assertGreaterEqual(latency, 1)
+
+    def test_non_204_returns_none(self) -> None:
+        from vpngate_to_singbox import _socks5_get_latency_ms
+
+        server = FakeSocks5Server(status_code=500)
+        server.start()
+        try:
+            latency = _socks5_get_latency_ms("127.0.0.1", server.port, timeout=5)
+        finally:
+            server.stop()
+
+        self.assertIsNone(latency)
+
+    def test_refused_connection_returns_none(self) -> None:
+        from vpngate_to_singbox import _socks5_get_latency_ms
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        free_port = sock.getsockname()[1]
+        sock.close()
+
+        self.assertIsNone(_socks5_get_latency_ms("127.0.0.1", free_port, timeout=2))
+
+
+def _real_csv() -> str:
+    return "\n".join([
+        CSV_HEADER,
+        _snapshot_row_country("vpn-a", "203.0.113.21", 3000,
+                              _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.21")),
+                              "Japan", "JP"),
+        _snapshot_row_country("vpn-b", "203.0.113.22", 2000,
+                              _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.22")),
+                              "Japan", "JP"),
+        _snapshot_row_country("vpn-c", "203.0.113.23", 1000,
+                              _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.23")),
+                              "Japan", "JP"),
+    ]) + "\n"
+
+
+class RealTopKTests(unittest.TestCase):
+    def test_measured_first_then_unmeasured_by_handshake(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        handshakes = {"203.0.113.21": 300, "203.0.113.22": 100, "203.0.113.23": 200}
+        real = {"203.0.113.22": 500, "203.0.113.23": 50}
+
+        nodes = snapshot_to_nodes(
+            _real_csv(),
+            probe_fn=lambda host, port: handshakes[host],
+            real_topk=2,
+            dial_fn=lambda node: real.get(node["server"]),
+        )
+
+        self.assertEqual(["203.0.113.23", "203.0.113.22", "203.0.113.21"],
+                         [n["server"] for n in nodes])
+        self.assertEqual([50, 500, None],
+                         [n["real_latency_ms"] for n in nodes])
+
+    def test_real_topk_zero_never_dials(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        calls: list = []
+        nodes = snapshot_to_nodes(
+            _real_csv(),
+            probe_fn=lambda host, port: 100,
+            real_topk=0,
+            dial_fn=lambda node: calls.append(node["server"]) or 1,
+        )
+
+        self.assertEqual([], calls)
+        self.assertTrue(all(n["real_latency_ms"] is None for n in nodes))
+
+    def test_dial_exception_treated_as_unmeasured(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        def bad_dial(node):
+            if node["server"] == "203.0.113.22":
+                raise RuntimeError("tunnel down")
+            return 70
+
+        nodes = snapshot_to_nodes(
+            _real_csv(),
+            probe_fn=lambda host, port: 100,
+            real_topk=3,
+            dial_fn=bad_dial,
+        )
+
+        by_server = {n["server"]: n for n in nodes}
+        self.assertIsNone(by_server["203.0.113.22"]["real_latency_ms"])
+        self.assertEqual(70, by_server["203.0.113.21"]["real_latency_ms"])
+        # measured nodes rank before the failed one
+        self.assertLess(
+            [n["server"] for n in nodes].index("203.0.113.21"),
+            [n["server"] for n in nodes].index("203.0.113.22"),
+        )
+
+    def test_limit_zero_returns_all_nodes(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        rows = [
+            _snapshot_row(f"vpn-{i}", f"203.0.113.{100 + i}", 1000 + i,
+                          _b64(TCP_OVPN.replace("203.0.113.1", f"203.0.113.{100 + i}")))
+            for i in range(5)
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        self.assertEqual(5, len(snapshot_to_nodes(csv_text, limit=0, probe=False)))
+
+    def test_default_limit_returns_all_nodes(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        rows = [
+            _snapshot_row(f"vpn-{i}", f"203.0.113.{100 + i}", 1000 + i,
+                          _b64(TCP_OVPN.replace("203.0.113.1", f"203.0.113.{100 + i}")))
+            for i in range(5)
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        self.assertEqual(5, len(snapshot_to_nodes(csv_text, probe=False)))
+
+
 class MixedInboundTests(unittest.TestCase):
     def test_mixed_inbound_included_when_requested(self) -> None:
         from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
