@@ -302,10 +302,11 @@ jobs:
           done
           curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"
           curl -m 10 -s http://127.0.0.1:8080/ui | grep -q "api/status"
-          if curl -m 10 -s http://127.0.0.1:8080/api/status | grep -q "401"; then
+          code=$(curl -m 10 -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/status)
+          if [ "$code" = "401" ]; then
             echo "unauthenticated /api/status correctly rejected"
           else
-            echo "expected 401 without token"; exit 1
+            echo "expected 401 without token, got $code"; exit 1
           fi
           curl -m 10 -s -H "Authorization: Bearer smoke-admin-token-0123456789" \
             http://127.0.0.1:8080/api/status | tee /tmp/smoke-status.json | python3 -m json.tool
