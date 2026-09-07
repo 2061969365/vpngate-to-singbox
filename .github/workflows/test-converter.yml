@@ -1,0 +1,56 @@
+name: Test vpngate-to-singbox converter
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Compile sources
+        run: python -m py_compile vpngate_to_singbox.py
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke test on sample ovpn
+        run: |
+          python vpngate_to_singbox.py \
+            --input tests/fixtures/vpngate_tcp_sample.ovpn \
+            --output /tmp/singbox.json --tag vpngate-0
+          python -m json.tool /tmp/singbox.json > /dev/null
+          python - <<'EOF'
+          import json
+          cfg = json.load(open("/tmp/singbox.json"))
+          ep = cfg["endpoints"][0]
+          assert ep["type"] == "openvpn-client", ep
+          assert ep["network"] == "tcp", ep
+          assert ep["system"] is False, ep
+          assert "BF-CBC" in ep["data_ciphers"], ep
+          assert "BEGIN CERTIFICATE" in ep["tls"]["certificate"], ep
+          print("converter assertions OK:", ep["server"], ep["server_port"])
+          EOF
+      - name: Upload generated config
+        uses: actions/upload-artifact@v6
+        with:
+          name: singbox-sample-config
+          path: /tmp/singbox.json
+
+  singbox-check:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: singbox-sample-config
+          path: /tmp
+      - name: Download sing-box v1.14.0
+        run: |
+          curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
+          ./sing-box-*/sing-box version
+      - name: Validate config with sing-box check
+        run: ./sing-box-*/sing-box check -c /tmp/singbox.json
