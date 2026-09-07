@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
+import io
 import json
 import re
 from pathlib import Path
@@ -91,6 +94,49 @@ def ovpn_to_endpoint(
     }
 
 
+def snapshot_to_endpoints(
+    csv_text: str,
+    limit: int = 8,
+    tag_prefix: str = "vpngate",
+    username: str = DEFAULT_USERNAME,
+    password: str = DEFAULT_PASSWORD,
+) -> list[dict]:
+    """Parse a VPNGate CSV snapshot, keep TCP-convertible rows, rank by Speed desc."""
+    lines = [ln for ln in csv_text.splitlines() if ln and not ln.startswith("*")]
+    if not lines:
+        raise ValueError("empty snapshot")
+    if lines[0].startswith("#"):
+        lines[0] = lines[0][1:]
+    reader = csv.DictReader(io.StringIO("\n".join(lines)))
+    if not reader.fieldnames or "OpenVPN_ConfigData_Base64" not in reader.fieldnames:
+        raise ValueError("snapshot columns are incomplete")
+
+    candidates: list[tuple[int, dict]] = []
+    for row in reader:
+        encoded = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+        if not encoded:
+            continue
+        try:
+            config_text = base64.b64decode(encoded, validate=True).decode("utf-8")
+            endpoint = ovpn_to_endpoint(config_text, tag="", username=username, password=password)
+        except (ValueError, UnicodeError):
+            continue  # UDP-only / broken / unsafe rows are skipped
+        try:
+            speed = int((row.get("Speed") or "0").strip() or "0")
+        except ValueError:
+            speed = 0
+        candidates.append((speed, endpoint))
+
+    if not candidates:
+        raise ValueError("snapshot contains no TCP-convertible nodes")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    endpoints = []
+    for index, (_, endpoint) in enumerate(candidates[:limit]):
+        endpoint["tag"] = f"{tag_prefix}-{index}"
+        endpoints.append(endpoint)
+    return endpoints
+
+
 def build_singbox_config(endpoints: list[dict]) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config."""
     tags = [ep["tag"] for ep in endpoints]
@@ -108,12 +154,25 @@ def build_singbox_config(endpoints: list[dict]) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Convert VPNGate .ovpn (TCP) to sing-box config")
-    parser.add_argument("--input", required=True, help="input .ovpn file")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--input", help="input .ovpn file")
+    group.add_argument("--csv", help="input VPNGate snapshot CSV file")
     parser.add_argument("--output", required=True, help="output sing-box JSON file")
-    parser.add_argument("--tag", default="vpngate-0", help="endpoint tag")
+    parser.add_argument("--tag", default="vpngate-0", help="endpoint tag (--input) or prefix (--csv)")
+    parser.add_argument("--limit", type=int, default=8, help="max endpoints for --csv mode")
     parser.add_argument("--username", default=DEFAULT_USERNAME)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
     args = parser.parse_args(argv)
+
+    if args.csv:
+        csv_text = Path(args.csv).read_text(encoding="utf-8")
+        endpoints = snapshot_to_endpoints(
+            csv_text, limit=args.limit, tag_prefix=args.tag,
+            username=args.username, password=args.password,
+        )
+        Path(args.output).write_text(json.dumps(build_singbox_config(endpoints), indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {args.output} with {len(endpoints)} endpoints")
+        return 0
 
     config_text = Path(args.input).read_text(encoding="utf-8")
     endpoint = ovpn_to_endpoint(config_text, tag=args.tag, username=args.username, password=args.password)

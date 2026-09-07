@@ -4,6 +4,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *" # hourly live check against the real VPNGate API
 
 jobs:
   test:
@@ -54,3 +56,35 @@ jobs:
           ./sing-box-*/sing-box version
       - name: Validate config with sing-box check
         run: ./sing-box-*/sing-box check -c /tmp/singbox.json
+
+  live-snapshot:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Fetch real VPNGate snapshot
+        run: |
+          curl -m 90 -sSL https://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv \
+            || curl -m 90 -sSL http://www.vpngate.net/api/iphone/ -o /tmp/vpngate.csv
+          wc -c /tmp/vpngate.csv
+          grep -c -v '^\*' /tmp/vpngate.csv
+      - name: Convert top TCP nodes
+        run: |
+          python vpngate_to_singbox.py --csv /tmp/vpngate.csv \
+            --limit 8 --output /tmp/singbox-live.json --tag vpngate
+          python - <<'EOF'
+          import json
+          cfg = json.load(open("/tmp/singbox-live.json"))
+          assert len(cfg["endpoints"]) >= 1, "no TCP endpoints converted"
+          for ep in cfg["endpoints"]:
+              assert ep["network"] == "tcp" and ep["system"] is False, ep
+          print("live endpoints:", [(e["server"], e["server_port"]) for e in cfg["endpoints"]])
+          EOF
+      - name: Download sing-box v1.14.0
+        run: |
+          curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
+      - name: Validate live config with sing-box check
+        run: ./sing-box-*/sing-box check -c /tmp/singbox-live.json

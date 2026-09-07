@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 out.json
+live_snapshot.csv
+live_singbox.json
 
