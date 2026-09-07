@@ -119,7 +119,7 @@ jobs:
         run: |
           curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz | tar xz
           ./sing-box-*/sing-box check -c /tmp/singbox-dial.json
-      - name: Real tunnel latency ranking (real_topk=2)
+      - name: Real tunnel latency ranking (informational)
         run: |
           export PATH="$PWD/sing-box-1.14.0-linux-amd64:$PATH"
           sing-box version
@@ -127,12 +127,11 @@ jobs:
           from vpngate_to_singbox import snapshot_to_nodes
           nodes = snapshot_to_nodes(open("/tmp/vpngate.csv", encoding="utf-8").read(),
                                     limit=8, real_topk=4, dial_timeout=90)
-          for n in nodes[:5]:
+          for n in nodes[:8]:
               print(n["server"], n["server_port"], "handshake=", n["latency_ms"],
                     "real=", n.get("real_latency_ms"), n.get("country_short"))
           measured = [n for n in nodes if n.get("real_latency_ms") is not None]
-          assert measured, "no node yielded real tunnel latency"
-          print(f"REAL LATENCY OK: {len(measured)} node(s) measured")
+          print(f"ranking done: {len(measured)}/{len(nodes)} yielded real latency (informational, no gate)")
           EOF
       - name: Dial through VPNGate and verify exit IP
         run: |
@@ -154,6 +153,13 @@ jobs:
               echo "exit IP via vpngate-$i: $EXIT_IP"
               if [ -n "$EXIT_IP" ] && [ "$EXIT_IP" != "$DIRECT_IP" ]; then
                 echo "DIAL OK: traffic exits via VPNGate, no TUN used"
+                python - "$i" <<'EOF'
+          import json, sys
+          cfg = json.load(open("/tmp/singbox-dial.json"))
+          ep = cfg["endpoints"][int(sys.argv[1])]
+          json.dump(ep, open("/tmp/working_ep.json", "w"), indent=2)
+          print("saved working endpoint", ep["server"], ep["server_port"], flush=True)
+          EOF
                 pkill -f singbox-try || true
                 exit 0
               fi
@@ -164,6 +170,18 @@ jobs:
           pkill -f singbox-try || true
           echo "all dial attempts failed"
           exit 1
+      - name: Validate measure_real_latency on known-good node
+        run: |
+          export PATH="$PWD/sing-box-1.14.0-linux-amd64:$PATH"
+          python - <<'EOF'
+          import json
+          from vpngate_to_singbox import measure_real_latency
+          ep = json.load(open("/tmp/working_ep.json"))
+          ms = measure_real_latency(ep, timeout=120)
+          print("measured real latency:", ms, "ms for", ep["server"], ep["server_port"])
+          assert ms is not None, "measure_real_latency returned None on a known-good tunnel"
+          print("MEASURE OK: deterministic E2E validation passed")
+          EOF
 
   live-stability:
     needs: test
