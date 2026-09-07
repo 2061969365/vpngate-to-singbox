@@ -518,5 +518,25 @@ class MeasureDiagnosticsTests(unittest.TestCase):
         self.assertLess(elapsed, 15)
 
 
+class DialProbeConfigTests(unittest.TestCase):
+    def test_final_pinned_to_probe_tag(self) -> None:
+        from vpngate_to_singbox import _dial_probe_config
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-3")
+        config = _dial_probe_config(endpoint, 41234)
+
+        self.assertEqual("dial-probe", config["route"]["final"])
+        self.assertEqual(["dial-probe"], [ep["tag"] for ep in config["endpoints"]])
+        self.assertEqual(41234, config["inbounds"][0]["listen_port"])
+
+    def test_serving_default_stays_on_auto(self) -> None:
+        from vpngate_to_singbox import build_singbox_config
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-3")
+        config = build_singbox_config([endpoint])
+
+        self.assertEqual("auto", config["route"]["final"])
+
+
 if __name__ == "__main__":
     unittest.main()

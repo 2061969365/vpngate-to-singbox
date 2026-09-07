@@ -307,6 +307,7 @@ jobs:
           docker run -d --name vpngate-test -p 8080:8080 \
             -e PORT=8080 -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
             -e ADMIN_TOKEN=smoke-admin-token-0123456789 \
+            -e REAL_TOPK=0 \
             vpngate-railway:test
           for i in $(seq 1 18); do
             if curl -m 5 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"; then
@@ -315,7 +316,8 @@ jobs:
             fi
             sleep 10
           done
-          curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"
+          curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$" || {
+            echo "healthz never OK; container log tail:"; docker logs vpngate-test 2>&1 | tail -n 30; exit 1; }
           curl -m 10 -s http://127.0.0.1:8080/ui | grep -q "api/status"
           code=$(curl -m 10 -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/status)
           if [ "$code" = "401" ]; then

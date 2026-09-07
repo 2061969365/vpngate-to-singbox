@@ -219,6 +219,22 @@ def _log_dial_failure(endpoint: dict, err_path: str) -> None:
           flush=True)
 
 
+def _dial_probe_config(endpoint: dict, port: int) -> dict:
+    """Throwaway single-endpoint config with the route pinned to the probe tag.
+
+    The serving config defaults route.final to the "auto" urltest group
+    (which includes direct) -- right for serving, wrong for measuring: urltest
+    would route around the endpoint under test. Probing must exit only
+    through the endpoint, like the proven manual dial path.
+    """
+    probe_endpoint = dict(endpoint)
+    probe_endpoint["tag"] = "dial-probe"
+    config = build_singbox_config([probe_endpoint], mixed_listen="127.0.0.1",
+                                  mixed_port=port)
+    config["route"]["final"] = "dial-probe"
+    return config
+
+
 def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                          timeout: int = 90, poll_interval: int = 2,
                          target_host: str = "www.gstatic.com",
@@ -226,10 +242,7 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                          path: str = "/generate_204") -> int | None:
     """Dial one endpoint with a throwaway sing-box; end-to-end GET ms or None."""
     port = _free_port()
-    probe_endpoint = dict(endpoint)
-    probe_endpoint["tag"] = "dial-probe"
-    config = build_singbox_config([probe_endpoint], mixed_listen="127.0.0.1",
-                                  mixed_port=port)
+    config = _dial_probe_config(endpoint, port)
     tmpdir = tempfile.TemporaryDirectory()
     try:
         cfg_path = str(Path(tmpdir.name) / "dial.json")
