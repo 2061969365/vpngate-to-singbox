@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 from vpngate_to_singbox import (
     build_singbox_config,
+    measure_exit_ip,
     measure_real_latency,
     nodes_to_endpoints,
     primary_server,
@@ -62,115 +63,348 @@ UI_HTML = """\
 <title>vpngate console</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-#topnav{display:flex;align-items:center;gap:26px;padding:16px 32px;font-size:14px}
-#topnav .logo{font-weight:700;font-size:16px}
+body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+body::before{content:"";position:fixed;inset:0;z-index:-1;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),radial-gradient(ellipse 50% 45% at 50% 100%,rgba(16,185,129,.14),transparent 70%),#000}
+#topnav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:26px;padding:14px 32px;font-size:14px;background:rgba(10,12,24,.72);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.09)}
+#topnav .logo{font-weight:800;font-size:16px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+#topnav .live{font-size:11px;color:#6ee7b7;border:1px solid rgba(110,231,183,.4);border-radius:999px;padding:2px 10px}
 #topnav .links{display:flex;gap:22px;color:#ccc}
 #topnav .right{margin-left:auto;display:flex;gap:14px;align-items:center}
-#topnav input{background:#111;border:1px solid #444;color:#fff;border-radius:6px;padding:6px 10px;font-size:13px}
-#topnav .cta{border:1px solid #555;border-radius:999px;padding:7px 18px;cursor:pointer}
-.hero{padding:70px 32px 56px;background:radial-gradient(ellipse 60% 50% at 70% 40%,rgba(64,120,255,.22),transparent 70%),radial-gradient(ellipse 40% 40% at 30% 70%,rgba(0,200,150,.12),transparent 70%),#000}
-#hero-kicker{font-size:56px;font-weight:700;letter-spacing:-.03em;line-height:1.05}
-#hero-sub{color:#b5b5b5;font-size:15px;line-height:1.65;max-width:760px;margin-top:14px}
-#pills{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
-#pills span{border:1px solid #444;border-radius:999px;padding:7px 18px;font-size:13px;color:#ddd;cursor:pointer}
-#pills span.on{background:#fff;color:#000;border-color:#fff}
-.actions{display:flex;gap:12px;margin-top:20px}
-#btn-verify{background:#fff;color:#000;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none}
-#btn-refresh{border:1px solid #555;border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:transparent;cursor:pointer}
-#btn-fullprobe{border:1px solid #8ab4ff;border-radius:999px;padding:10px 26px;font-size:14px;color:#8ab4ff;background:transparent;cursor:pointer}
-.section{padding:44px 32px;border-top:1px solid #1c1c1c;max-width:1200px}
-.section h2{font-size:26px;font-weight:600;margin-bottom:12px}
-.section p{color:#b5b5b5;font-size:14px;line-height:1.7;max-width:800px;margin-bottom:16px}
+#topnav input{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:7px 12px;font-size:13px}
+#topnav .cta{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06)}
+#topnav .cta:hover{background:rgba(255,255,255,.14)}
+.wrap{max-width:1180px;margin:0 auto;padding:34px 28px 60px}
+.glass-card{background:rgba(255,255,255,.055);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.11);border-radius:22px;padding:28px 30px;margin-bottom:22px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+.glass-card h2{font-size:19px;font-weight:700;margin-bottom:6px}
+.glass-card .desc{color:#a8adbd;font-size:13px;line-height:1.7;margin-bottom:16px}
+#exit-card{background:linear-gradient(135deg,rgba(99,102,241,.2),rgba(34,211,238,.1)),rgba(255,255,255,.055)}
+#hero-kicker{font-size:52px;font-weight:800;letter-spacing:-.03em;line-height:1.08;background:linear-gradient(92deg,#fff,#a5b4fc 60%,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+#hero-sub{color:#c2c7d6;font-size:14px;margin-top:10px}
+#verify-result{margin-top:12px;font-size:14px;color:#6ee7b7;min-height:22px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+.stat{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:16px 18px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.stat .k{font-size:12px;color:#8b91a5}
+.stat .v{font-size:24px;font-weight:700;margin-top:4px}
+.btn{border-radius:999px;padding:10px 24px;font-size:14px;cursor:pointer;border:1px solid rgba(255,255,255,.2);color:#fff;background:rgba(255,255,255,.07);transition:transform .12s ease,background .15s ease}
+.btn:hover{background:rgba(255,255,255,.15)}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.55;cursor:wait;transform:none}
+.btn.primary{background:linear-gradient(92deg,#6366f1,#0ea5e9);border:none;font-weight:600;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+.btn.busy{animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+#pills{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}
+#pills span{border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:7px 18px;font-size:13px;color:#ddd;cursor:pointer;background:rgba(255,255,255,.04)}
+#pills span.on{background:linear-gradient(92deg,#6366f1,#0ea5e9);color:#fff;border-color:transparent}
+.actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap}
+#btn-verify{background:linear-gradient(92deg,#6366f1,#0ea5e9);color:#fff;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+#btn-refresh{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:rgba(255,255,255,.07);cursor:pointer}
+#btn-fullprobe{border:1px solid rgba(138,180,255,.55);border-radius:999px;padding:10px 26px;font-size:14px;color:#8ab4ff;background:rgba(138,180,255,.08);cursor:pointer}
+#btn-verify:disabled,#btn-refresh:disabled,#btn-fullprobe:disabled{opacity:.55;cursor:wait}
+#node-search{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 14px;font-size:13px;width:230px}
 table.bench{width:100%;border-collapse:collapse;font-size:14px}
-table.bench th,table.bench td{text-align:left;padding:10px 14px;border-bottom:1px solid #222}
-table.bench th{color:#888;font-weight:500}
+table.bench th,table.bench td{text-align:left;padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
+table.bench th{color:#8b91a5;font-weight:500;font-size:12px}
+table.bench tr:hover td{background:rgba(255,255,255,.035)}
 table.bench td.hl{color:#fff;font-weight:600}
-table.bench td.op a{color:#8ab4ff;cursor:pointer;text-decoration:none}
-#history-line{color:#888;font-size:13px;margin-top:16px}
-.footer{border-top:1px solid #1c1c1c;padding:28px 32px;display:flex;gap:48px;color:#888;font-size:13px}
-.footer b{color:#ccc;display:block;margin-bottom:8px}
-@media(max-width:768px){#hero-kicker{font-size:36px}.hero,.section{padding-left:18px;padding-right:18px}#topnav .links{display:none}}
+table.bench td.op a{color:#8ab4ff;cursor:pointer;text-decoration:none;margin-right:12px}
+table.bench td.op a:hover{text-decoration:underline}
+.badge{display:inline-block;font-size:11px;border-radius:999px;padding:2px 10px;margin-left:8px;background:linear-gradient(92deg,#6366f1,#0ea5e9);color:#fff}
+.badge.probing{background:rgba(251,191,36,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.4)}
+#probe-progress{display:none;margin:14px 0 4px}
+#probe-progress.show{display:block}
+#probe-progress .bar{height:8px;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
+#probe-progress .fill{height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,#6366f1,#22d3ee);transition:width .4s ease}
+#probe-progress .txt{font-size:12px;color:#8b91a5;margin-top:6px}
+#history-line{color:#8b91a5;font-size:13px;margin-top:14px}
+#history-list{list-style:none;margin-top:10px;max-height:220px;overflow:auto}
+#history-list li{font-size:12.5px;color:#a8adbd;padding:7px 4px;border-bottom:1px dashed rgba(255,255,255,.08)}
+#history-list li b{color:#e5e7eb;font-weight:600}
+#toast{position:fixed;right:22px;bottom:22px;z-index:100;display:flex;flex-direction:column;gap:10px}
+.toast-msg{background:rgba(16,20,36,.92);border:1px solid rgba(110,231,183,.45);color:#d1fae5;border-radius:14px;padding:12px 18px;font-size:13px;max-width:360px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:slidein .25s ease}
+.toast-msg.err{border-color:rgba(248,113,113,.55);color:#fecaca}
+@keyframes slidein{from{transform:translateY(12px);opacity:0}to{transform:none;opacity:1}}
+.footer{color:#69707f;font-size:12.5px;text-align:center;padding:10px 0 30px}
+#login-gate{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),rgba(0,0,0,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+#login-gate.hidden{display:none}
+.login-card{width:380px;max-width:92vw;text-align:center;padding:40px 36px}
+.login-card .logo{font-weight:800;font-size:22px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+.login-card .sub{color:#8b91a5;font-size:13px;margin:10px 0 22px}
+#login-token{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);color:#fff;border-radius:12px;padding:12px 16px;font-size:14px;margin-bottom:14px;text-align:center}
+#btn-login{width:100%;background:linear-gradient(92deg,#6366f1,#0ea5e9);color:#fff;border-radius:12px;padding:12px;font-size:15px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+#btn-login:disabled{opacity:.55;cursor:wait}
+#login-err{color:#fca5a5;font-size:13px;min-height:20px;margin-top:12px}
+.shake{animation:shake .4s ease}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+#console.hidden{display:none}
+#btn-lock{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
+#btn-lock:hover{background:rgba(255,255,255,.14)}
+@media(max-width:768px){#hero-kicker{font-size:34px}.wrap{padding:20px 14px 44px}.stats{grid-template-columns:repeat(2,1fr)}#topnav .links{display:none}}
 </style></head>
 <body>
-<div id="topnav"><span class="logo">vpngate</span><span class="links"><span>总览</span><span>节点</span><span>历史</span></span><span class="right"><input id="token" type="password" size="18" placeholder="ADMIN_TOKEN"><span class="cta" onclick="saveToken()">Save</span></span></div>
-<div class="hero">
+<div id="topnav"><span class="logo">vpngate</span><span class="live">● LIVE</span><span class="links"><span>总览</span><span>节点</span><span>历史</span></span><span class="right"><button id="btn-lock" onclick="lockConsole()">锁定</button></span></div>
+<div id="login-gate"><div class="login-card glass-card"><div class="logo">vpngate</div><div class="sub">输入 ADMIN_TOKEN 进入控制台</div><input id="login-token" type="password" placeholder="ADMIN_TOKEN" onkeydown="if(event.key==='Enter')loginEnter()"><button id="btn-login" onclick="loginEnter()">进入控制台</button><p id="login-err"></p></div></div>
+<div class="wrap" id="console" style="display:none">
+<div id="exit-card" class="glass-card">
 <div id="hero-kicker">—<br>—</div>
 <p id="hero-sub">loading…</p>
-<div id="pills"></div>
-<div class="actions"><button id="btn-verify" onclick="verifyNow()">验证出口 IP</button><button id="btn-refresh" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" onclick="fullProbeNow()">全量真测</button></div>
+<p id="verify-result"></p>
+<div class="actions"><button id="btn-verify" onclick="verifyExit()">验证出口 IP</button></div>
 </div>
-<div class="section">
+<div class="stats">
+<div class="stat"><div class="k">可用节点</div><div class="v" id="stat-nodes">—</div></div>
+<div class="stat"><div class="k">最优实测</div><div class="v" id="stat-best">—</div></div>
+<div class="stat"><div class="k">运行时间</div><div class="v" id="stat-uptime">—</div></div>
+<div class="stat"><div class="k">刷新成功/失败</div><div class="v" id="stat-refresh">—</div></div>
+</div>
+<div class="glass-card">
 <h2>可用节点</h2>
-<p>按隧道延迟排序。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。</p>
+<p class="desc">按隧道延迟排序。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。</p>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" placeholder="搜索 tag / 国家…" oninput="refresh()"><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button></div>
+<div id="pills"></div>
+<div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill"></div></div><div class="txt" id="probe-txt"></div></div>
 <table class="bench"><thead><tr><th>Endpoint</th><th>国家</th><th>握手</th><th>实测</th><th>存活</th><th>操作</th></tr></thead><tbody id="bench-body"></tbody></table>
-<p id="history-line"></p>
 </div>
-<div class="footer"><div><b>控制台</b><div>总览 · 节点 · 历史</div></div><div><b>状态</b><div id="foot-status">—</div></div><div><b>说明</b><div>自用调试 · sing-box 内部协议栈 · 无 TUN</div></div></div>
+<div class="glass-card">
+<h2>事件</h2>
+<p class="desc">刷新 / 切换 / 测速 / 验证记录，最近 20 条。</p>
+<p id="history-line"></p>
+<ul id="history-list"></ul>
+</div>
+<div class="footer"><span id="foot-status">—</span><span> · 自用调试 · sing-box 内部协议栈 · 无 TUN</span></div>
+</div>
+<div id="toast"></div>
 <script>
 var activeCountry = "";
+var lastStatus = null;
 function authHeaders() {
   return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
 }
-function saveToken() {
-  localStorage.setItem("admin_token", document.getElementById("token").value);
+function showConsole() {
+  document.getElementById("login-gate").classList.add("hidden");
+  document.getElementById("console").style.display = "";
   refresh();
+}
+function lockConsole() {
+  localStorage.removeItem("admin_token");
+  document.getElementById("console").style.display = "none";
+  const gate = document.getElementById("login-gate");
+  gate.classList.remove("hidden");
+  document.getElementById("login-token").value = "";
+  document.getElementById("login-err").textContent = "";
+}
+async function loginEnter() {
+  const input = document.getElementById("login-token");
+  const btn = document.getElementById("btn-login");
+  const err = document.getElementById("login-err");
+  const trial = input.value.trim();
+  if (!trial) { err.textContent = "请先填写 token"; return; }
+  btn.disabled = true;
+  btn.textContent = "验证中…";
+  err.textContent = "";
+  localStorage.setItem("admin_token", trial);
+  try {
+    await api("/api/status");
+    showConsole();
+  } catch (e) {
+    localStorage.removeItem("admin_token");
+    err.textContent = "token 不对，请重试";
+    const card = document.querySelector(".login-card");
+    card.classList.remove("shake");
+    void card.offsetWidth;
+    card.classList.add("shake");
+  }
+  btn.disabled = false;
+  btn.textContent = "进入控制台";
+}
+async function silentLogin() {
+  if (!localStorage.getItem("admin_token")) return;
+  try {
+    await api("/api/status");
+    showConsole();
+  } catch (e) {
+    localStorage.removeItem("admin_token");
+  }
+}
+function toast(msg, isErr) {
+  const box = document.getElementById("toast");
+  const el = document.createElement("div");
+  el.className = "toast-msg" + (isErr ? " err" : "");
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 4500);
+}
+function setBusy(id, busy, busyText) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (busy) {
+    if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
+    el.disabled = true;
+    el.classList.add("busy");
+    el.textContent = busyText || "进行中…";
+  } else {
+    el.disabled = false;
+    el.classList.remove("busy");
+    if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig;
+  }
 }
 async function api(path, method, body) {
   const r = await fetch(path, {method: method || "GET", headers: authHeaders(),
     body: body ? JSON.stringify(body) : undefined});
   if (r.status === 401) throw new Error("unauthorized: save ADMIN_TOKEN first");
+  if (!r.ok) throw new Error("HTTP " + r.status + ": " + (await r.text()).slice(0, 160));
   return r.json();
 }
 function fmtMs(v) { return v == null ? "—" : v + "ms"; }
+function safeTag(t) { return String(t || "").replace(/[^a-zA-Z0-9-_]/g, ""); }
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+function nodeQuery() { const el = document.getElementById("node-search"); return el ? el.value.trim().toLowerCase() : ""; }
 async function refresh() {
   try {
     const s = await api("/api/status");
-    const eps = s.endpoints.filter(e => !activeCountry || e.country_short === activeCountry);
+    lastStatus = s;
+    const q = nodeQuery();
+    const eps = s.endpoints.filter(e => (!activeCountry || e.country_short === activeCountry) &&
+      (!q || (e.tag || "").toLowerCase().includes(q) || (e.country_short || "").toLowerCase().includes(q)));
     const pref = s.endpoints.find(e => e.tag === s.preferred_tag) || eps[0];
     document.getElementById("hero-kicker").innerHTML =
-      (pref ? pref.country_short + "<br>" + fmtMs(pref.real_latency_ms != null ? pref.real_latency_ms : pref.latency_ms) : "—<br>无节点");
+      (pref ? esc(pref.country_short) + "<br>" + fmtMs(pref.real_latency_ms != null ? pref.real_latency_ms : pref.latency_ms) : "—<br>无节点");
     document.getElementById("hero-sub").textContent =
       pref ? ("经 " + pref.tag + " 出站 · " + pref.server + ":" + pref.server_port + " · 存活 " + (pref.alive_seconds || 0) + "s") : "暂无可用节点";
+    renderVerify(s.verify, pref);
+    document.getElementById("stat-nodes").textContent = s.endpoints.length;
+    const measured = s.endpoints.filter(e => e.real_latency_ms != null).map(e => e.real_latency_ms);
+    document.getElementById("stat-best").textContent = measured.length ? Math.min.apply(null, measured) + "ms" : "—";
+    document.getElementById("stat-uptime").textContent = Math.floor((s.uptime_seconds || 0) / 60) + "m";
+    document.getElementById("stat-refresh").textContent = s.refresh_ok + "/" + s.refresh_fail;
     document.getElementById("pills").innerHTML =
       '<span data-c="" class="' + (activeCountry === "" ? "on" : "") + '">全部 ' + s.endpoints.length + "</span>" +
-      s.countries.map(c => '<span data-c="' + c.code + '" class="' + (activeCountry === c.code ? "on" : "") + '">' + c.name + "</span>").join("");
+      s.countries.map(c => '<span data-c="' + c.code + '" class="' + (activeCountry === c.code ? "on" : "") + '">' + esc(c.name) + "</span>").join("");
     document.querySelectorAll("#pills span").forEach(el => el.onclick = () => { activeCountry = el.getAttribute("data-c"); refresh(); });
-    document.getElementById("bench-body").innerHTML = eps.map(e =>
-      "<tr><td class='hl'>" + e.tag + (e.tag === s.preferred_tag ? " *pinned" : "") + "</td><td>" + e.country_short + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
+    const probingTag = (s.probe && s.probe.state === "running") ? s.probe.tag : null;
+    document.getElementById("bench-body").innerHTML = eps.map(e => {
+      const t = safeTag(e.tag);
+      const pinned = e.tag === s.preferred_tag ? '<span class="badge">pinned</span>' : "";
+      const probing = e.tag === probingTag ? '<span class="badge probing">测速中</span>' : "";
+      return "<tr><td class='hl'>" + esc(e.tag) + pinned + probing + "</td><td>" + esc(e.country_short) + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
       "</td><td class='hl'>" + fmtMs(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
-      "<td class='op'><a onclick='probeOne(" + e.tag + ")'>测速</a> <a onclick='switchTag(" + e.tag + ")'>切换</a></td></tr>").join("");
+      "<td class='op'><a data-probe='" + t + "'>测速</a><a data-switch='" + t + "'>切换</a></td></tr>";
+    }).join("");
+    renderProbeProgress(s.full_probe);
     document.getElementById("history-line").textContent =
-      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error +
-      (s.full_probe && s.full_probe.state !== "idle" ? " · 全量真测: " + s.full_probe.state + " " + s.full_probe.done + "/" + s.full_probe.total : "");
+      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error;
+    document.getElementById("history-list").innerHTML =
+      (s.refresh_history || []).slice().reverse().slice(0, 12).map(h => "<li><b>" + esc(h.event) + "</b> " + esc(h.detail || "") + " · " + esc(h.ts || "") + "</li>").join("");
     document.getElementById("foot-status").textContent = "uptime " + s.uptime_seconds + "s · refresh " + s.refresh_ok + "/" + s.refresh_fail;
   } catch (e) {
     document.getElementById("hero-sub").textContent = "status fetch failed: " + e;
+    toast("状态拉取失败: " + e.message, true);
   }
 }
+function renderVerify(v, pref) {
+  const el = document.getElementById("verify-result");
+  if (!v || v.state === "idle") {
+    el.textContent = pref ? "尚未验证当前出口，点击「验证出口 IP」真实走一次 VPN 链路。" : "";
+    return;
+  }
+  if (v.state === "running") {
+    el.textContent = "正在经 " + (v.via_tag || "…") + " 验证出口…";
+    return;
+  }
+  el.textContent = v.exit_ip ? ("当前出口 IP：" + v.exit_ip + "（经 " + v.via_tag + "，" + v.ms + "ms）")
+    : ("验证失败" + (v.error ? "：" + v.error : ""));
+}
+function renderProbeProgress(fp) {
+  const box = document.getElementById("probe-progress");
+  if (!fp || fp.state === "idle" || !fp.total) { box.classList.remove("show"); return; }
+  box.classList.add("show");
+  const pct = fp.total ? Math.round(fp.done / fp.total * 100) : 0;
+  document.getElementById("probe-fill").style.width = pct + "%";
+  document.getElementById("probe-txt").textContent = "全量真测 " + fp.state + " " + fp.done + "/" + fp.total + "（" + pct + "%）";
+}
 async function switchTag(tag) {
-  await api("/api/switch", "POST", {"tag": tag});
+  try {
+    const r = await api("/api/switch", "POST", {"tag": tag});
+    toast("已切换到 " + (r.preferred_tag || tag));
+  } catch (e) { toast("切换失败: " + e.message, true); }
   refresh();
 }
 async function probeOne(tag) {
-  await api("/api/switch", "POST", {"tag": tag});
+  try {
+    await api("/api/probe", "POST", {"tag": tag});
+    toast("单测 " + tag + " 进行中…");
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await api("/api/status");
+      lastStatus = s;
+      renderProbeProgress(s.full_probe);
+      if (s.probe && s.probe.state === "done" && s.probe.tag === tag) {
+        toast(s.probe.ms != null ? ("单测 " + tag + " 完成：" + s.probe.ms + "ms") : ("单测 " + tag + " 未打通"));
+        break;
+      }
+    }
+  } catch (e) { toast("单测失败: " + e.message, true); }
   refresh();
 }
 async function refreshNow() {
-  await api("/api/refresh", "POST", {});
+  setBusy("btn-refresh", true, "刷新中…");
+  try {
+    const r = await api("/api/refresh", "POST", {});
+    toast(r.ok ? "节点已刷新" : "刷新完成但有失败");
+  } catch (e) { toast("刷新失败: " + e.message, true); }
+  setBusy("btn-refresh", false);
   refresh();
 }
 async function fullProbeNow() {
-  await api("/api/full_probe", "POST", {});
+  setBusy("btn-fullprobe", true, "真测中…");
+  try {
+    await api("/api/full_probe", "POST", {});
+    toast("全量真测已开始，后台逐个拨号…");
+    for (let i = 0; i < 200; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await api("/api/status");
+      lastStatus = s;
+      renderProbeProgress(s.full_probe);
+      if (s.full_probe && s.full_probe.state === "done") {
+        toast("全量真测完成：" + s.full_probe.done + "/" + s.full_probe.total);
+        break;
+      }
+    }
+  } catch (e) { toast("全量真测失败: " + e.message, true); }
+  setBusy("btn-fullprobe", false);
   refresh();
 }
-async function verifyNow() {
-  await refresh();
-  document.getElementById("hero-sub").textContent += " · 已重新验证";
+async function verifyExit() {
+  setBusy("btn-verify", true, "验证中…");
+  document.getElementById("verify-result").textContent = "正在建立 VPN 链路并抓取出口 IP…";
+  try {
+    await api("/api/verify", "POST", {});
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await api("/api/status");
+      lastStatus = s;
+      renderVerify(s.verify);
+      if (s.verify && s.verify.state === "done") {
+        toast(s.verify.exit_ip ? ("出口 IP：" + s.verify.exit_ip) : "验证未拿到出口 IP", !s.verify.exit_ip);
+        break;
+      }
+    }
+  } catch (e) {
+    document.getElementById("verify-result").textContent = "";
+    toast("验证失败: " + e.message, true);
+  }
+  setBusy("btn-verify", false);
+  refresh();
 }
-document.getElementById("token").value = localStorage.getItem("admin_token") || "";
-refresh();
-setInterval(refresh, 10000);
+silentLogin();
+document.getElementById("bench-body").onclick = (ev) => {
+  const link = ev.target && ev.target.closest ? ev.target.closest("a") : null;
+  if (!link) return;
+  const p = link.getAttribute("data-probe");
+  const sw = link.getAttribute("data-switch");
+  if (p) probeOne(p);
+  else if (sw) switchTag(sw);
+};
+setInterval(() => { if (document.getElementById("console").style.display !== "none") refresh(); }, 15000);
 </script>
 </body></html>
 """
@@ -211,11 +445,16 @@ def build_config_from_env(env: dict) -> dict:
     if urllib.parse.urlsplit(snapshot_url).scheme != "https":
         print("refusing to start: SNAPSHOT_URL must be https", flush=True)
         raise SystemExit(2)
-    admin_token = env.get("ADMIN_TOKEN", "")
-    generated = False
-    if len(admin_token) < MIN_ADMIN_TOKEN_LEN:
-        admin_token = secrets.token_urlsafe(24)
-        generated = True
+    if "ADMIN_TOKEN" not in env or not env["ADMIN_TOKEN"]:
+        admin_token = "vpn"
+        generated = False
+        print("ADMIN_TOKEN not set, defaulting to 'vpn'", flush=True)
+    else:
+        admin_token = env["ADMIN_TOKEN"]
+        generated = False
+        if len(admin_token) < MIN_ADMIN_TOKEN_LEN:
+            admin_token = secrets.token_urlsafe(24)
+            generated = True
     return {
         "port": int(env.get("PORT", "8080")),
         "mixed_port": int(env.get("MIXED_PORT", "40000")),
@@ -233,6 +472,7 @@ def build_config_from_env(env: dict) -> dict:
         "vless_chain_port": int(env.get("VLESS_CHAIN_PORT", "8082")),
         "tunnel_token": env.get("TUNNEL_TOKEN", ""),
         "cloudflared_bin": env.get("CLOUDFLARED_BIN", "cloudflared"),
+        "disguise_path": env.get("DISGUISE_PATH", ""),
     }
 
 
@@ -287,11 +527,13 @@ class RailwayManager:
         limit: int | None = 0,
         real_topk: int = 0,
         dial_fn=None,
+        verify_fn=None,
         vless_uuid: str = "",
         vless_direct_port: int = 8080,
         vless_chain_port: int = 8082,
         tunnel_token: str = "",
         cloudflared_bin: str = "cloudflared",
+        disguise_path: str = "",
         config_path: str = "singbox-railway.json",
         nodes_path: str = "nodes.json",
         state_path: str = "state.json",
@@ -314,6 +556,9 @@ class RailwayManager:
         self.dial_fn = (dial_fn if dial_fn is not None else
                         (lambda node: measure_real_latency(
                             node["endpoint"], self.singbox_bin)))
+        self.verify_fn = (verify_fn if verify_fn is not None else
+                          (lambda endpoint: measure_exit_ip(
+                              endpoint, self.singbox_bin)))
         self.config_path = config_path
         self.nodes_path = nodes_path
         self.state_path = state_path
@@ -329,6 +574,7 @@ class RailwayManager:
         self.vless_chain_port = vless_chain_port
         self.tunnel_token = tunnel_token
         self.cloudflared_bin = cloudflared_bin
+        self.disguise_path = disguise_path
         self._cloudflared_proc: subprocess.Popen | None = None
         self.preferred_tag: str | None = None
         self._nodes: list[dict] = []
@@ -351,9 +597,14 @@ class RailwayManager:
             "proxy": f"127.0.0.1:{mixed_port}",
             "traffic": {"connections": 0, "bytes_up": 0, "bytes_down": 0},
             "full_probe": {"state": "idle", "done": 0, "total": 0},
+            "probe": {"state": "idle", "tag": None, "ms": None, "error": None},
+            "verify": {"state": "idle", "exit_ip": None, "ms": None,
+                       "via_tag": None, "error": None},
             "tunnel": {"state": "off"},
         }
         self._full_probe_thread: threading.Thread | None = None
+        self._single_probe_thread: threading.Thread | None = None
+        self._verify_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._listener: socket.socket | None = None
         self._singbox_proc: subprocess.Popen | None = None
@@ -475,7 +726,16 @@ class RailwayManager:
                 client.sendall(_http_response("503 Service Unavailable",
                                               "text/plain", b"not ready"))
             return
-        if path in ("/", "/ui") and method == "GET":
+        if path == "/" and method == "GET":
+            body = self._disguise_body()
+            if body is not None:
+                client.sendall(_http_response("200 OK", "text/html; charset=utf-8",
+                                              body))
+            else:
+                client.sendall(_http_response("200 OK", "text/html; charset=utf-8",
+                                              UI_HTML.encode()))
+            return
+        if path == "/ui" and method == "GET":
             client.sendall(_http_response("200 OK", "text/html; charset=utf-8",
                                           UI_HTML.encode()))
             return
@@ -495,6 +755,41 @@ class RailwayManager:
             client.sendall(_http_response(
                 "202 Accepted", "application/json",
                 json.dumps({"accepted": True}).encode()))
+        elif path == "/api/probe" and method == "POST":
+            try:
+                payload = json.loads((body or b"{}").decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict) or not payload.get("tag"):
+                client.sendall(_http_response("400 Bad Request", "text/plain",
+                                              b"missing tag"))
+                return
+            node = next((n for n in self._nodes
+                         if n.get("endpoint", {}).get("tag") == payload["tag"]),
+                        None)
+            if node is None:
+                client.sendall(_http_response(
+                    "404 Not Found", "application/json",
+                    json.dumps({"ok": False, "error": "unknown tag"}).encode()))
+                return
+            self._start_single_probe(node)
+            client.sendall(_http_response(
+                "202 Accepted", "application/json",
+                json.dumps({"accepted": True,
+                            "tag": node["endpoint"]["tag"]}).encode()))
+        elif path == "/api/verify" and method == "POST":
+            node = self._verify_target_node()
+            if node is None:
+                client.sendall(_http_response(
+                    "503 Service Unavailable", "application/json",
+                    json.dumps({"ok": False,
+                                "error": "no nodes"}).encode()))
+                return
+            self._start_verify(node)
+            client.sendall(_http_response(
+                "202 Accepted", "application/json",
+                json.dumps({"accepted": True,
+                            "via_tag": node.get("endpoint", {}).get("tag")}).encode()))
         elif path == "/api/switch" and method == "POST":
             try:
                 payload = json.loads((body or b"{}").decode("utf-8") or "{}")
@@ -515,6 +810,16 @@ class RailwayManager:
                                           b"method not allowed"))
         else:
             client.sendall(_http_response("404 Not Found", "text/plain", b"not found"))
+
+    def _disguise_body(self) -> bytes | None:
+        """Disguise page bytes for GET /, or None to fall back to the console."""
+        if not self.disguise_path:
+            return None
+        try:
+            with open(self.disguise_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
 
     def _healthy(self) -> bool:
         with self._lock:
@@ -932,6 +1237,79 @@ class RailwayManager:
                 self.status["endpoints"].append(entry)
                 by_key[key] = entry
 
+    def _start_single_probe(self, node: dict) -> None:
+        with self._lock:
+            tag = node.get("endpoint", {}).get("tag")
+            self.status["probe"] = {"state": "running", "tag": tag,
+                                    "ms": None, "error": None}
+        thread = threading.Thread(target=self._run_single_probe, args=(node,),
+                                  daemon=True)
+        self._single_probe_thread = thread
+        thread.start()
+
+    def _run_single_probe(self, node: dict) -> None:
+        # No startup gate here (unlike the full probe): the caller polls
+        # /api/status for state==done, and an instant dial_fn in tests still
+        # lands "done" only after the thread actually ran.
+        tag = node.get("endpoint", {}).get("tag")
+        try:
+            ms = self.dial_fn(node)
+            error = None
+        except Exception as exc:
+            ms = None
+            error = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            node["real_latency_ms"] = ms
+            key = (node.get("server"), node.get("server_port"))
+            for ep in self.status["endpoints"]:
+                if (ep.get("server"), ep.get("server_port")) == key:
+                    ep["real_latency_ms"] = ms
+                    break
+            # The node was already in the sing-box config (every live node
+            # gets an endpoint at refresh), so a measured node is immediately
+            # switchable -- no config rebuild needed.
+            self.status["probe"] = {"state": "done", "tag": tag,
+                                    "ms": ms, "error": error}
+        self._record_history("single-probe", f"{tag} ms={ms}")
+
+    def _verify_target_node(self) -> dict | None:
+        """Node backing the live chain: pinned preferred, else first node."""
+        if self.preferred_tag:
+            for node in self._nodes:
+                if node.get("endpoint", {}).get("tag") == self.preferred_tag:
+                    return node
+        return self._nodes[0] if self._nodes else None
+
+    def _start_verify(self, node: dict) -> None:
+        with self._lock:
+            tag = node.get("endpoint", {}).get("tag")
+            self.status["verify"] = {"state": "running", "exit_ip": None,
+                                     "ms": None, "via_tag": tag,
+                                     "error": None}
+        thread = threading.Thread(target=self._run_verify, args=(node,),
+                                  daemon=True)
+        self._verify_thread = thread
+        thread.start()
+
+    def _run_verify(self, node: dict) -> None:
+        # Startup gate so /api/status readers can observe the "running"
+        # state even when verify_fn returns instantly (e.g. in tests).
+        time.sleep(0.2)
+        tag = node.get("endpoint", {}).get("tag")
+        endpoint = node.get("endpoint") or node
+        try:
+            result = self.verify_fn(endpoint)
+            exit_ip, ms = result if result else (None, None)
+            error = None if exit_ip else "no exit ip measured"
+        except Exception as exc:
+            exit_ip, ms = None, None
+            error = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            self.status["verify"] = {"state": "done", "exit_ip": exit_ip,
+                                     "ms": ms, "via_tag": tag,
+                                     "error": error}
+        self._record_history("verify-done", f"{tag} exit={exit_ip} ms={ms}")
+
     def _fetch_with_retry(self, fetch) -> str:
         last_exc: Exception | None = None
         delays = [0] + list(self.retry_delays)
@@ -1087,6 +1465,7 @@ def main() -> int:
         vless_chain_port=cfg["vless_chain_port"],
         tunnel_token=cfg["tunnel_token"],
         cloudflared_bin=cfg["cloudflared_bin"],
+        disguise_path=cfg["disguise_path"],
         config_path=os.path.join(data_dir, "singbox-railway.json"),
         nodes_path=os.path.join(data_dir, "nodes.json"),
         state_path=os.path.join(data_dir, "state.json"),

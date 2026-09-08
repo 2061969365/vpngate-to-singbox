@@ -255,6 +255,91 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
                 pass
 
 
+def _socks5_get_text(proxy_host: str, proxy_port: int,
+                     target_host: str = "api.ipify.org",
+                     target_port: int = 443,
+                     path: str = "/?format=text",
+                     timeout: float = 20) -> tuple | None:
+    """One HTTPS GET through a SOCKS5 proxy; (code, body, ms) or None.
+
+    Same handshake as _socks5_get_latency_ms, but returns the response
+    body so callers can read small text APIs (e.g. api.ipify.org).
+    """
+    family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
+    sock = None
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((proxy_host, proxy_port))
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exact(sock, 2) != b"\x05\x00":
+            return None
+        try:
+            addr = socket.inet_aton(target_host)
+            request = b"\x05\x01\x00\x01" + addr + target_port.to_bytes(2, "big")
+        except OSError:
+            encoded = target_host.encode("idna")
+            if len(encoded) > 255:
+                return None
+            request = (b"\x05\x01\x00\x03" + bytes([len(encoded)]) + encoded
+                       + target_port.to_bytes(2, "big"))
+        sock.sendall(request)
+        reply = _recv_exact(sock, 4)
+        if reply[1] != 0:
+            return None
+        atyp = reply[3]
+        if atyp == 1:
+            _recv_exact(sock, 6)
+        elif atyp == 3:
+            _recv_exact(sock, _recv_exact(sock, 1)[0] + 2)
+        elif atyp == 4:
+            _recv_exact(sock, 18)
+        else:
+            return None
+        try:
+            sock = ssl.create_default_context().wrap_socket(
+                sock, server_hostname=target_host)
+        except OSError:
+            return None
+        start = time.monotonic()
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {target_host}\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        raw = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                return None
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 65536:
+                return None
+        ms = max(1, int((time.monotonic() - start) * 1000))
+        head, _, body = raw.partition(b"\r\n\r\n")
+        try:
+            code = int(head.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            return None
+        return (code, body.strip(), ms)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _looks_like_ipv4(text: bytes) -> bool:
+    try:
+        socket.inet_aton(text.decode("ascii").strip())
+    except (OSError, ValueError, UnicodeError):
+        return False
+    return text.count(b".") == 3
+
+
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -346,6 +431,77 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     pass
             _log_dial_failure(endpoint, err_path)
             return None
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+    finally:
+        tmpdir.cleanup()
+
+
+def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
+                    timeout: int = 90, poll_interval: int = 2) -> tuple:
+    """Exit IP through one endpoint: (ip, ms) or (None, None).
+
+    Same throwaway sing-box dial as measure_real_latency, but fetches
+    api.ipify.org so the caller learns the actual exit IP, not just
+    the end-to-end latency.
+    """
+    port = _free_port()
+    config = _dial_probe_config(endpoint, port)
+    tmpdir = tempfile.TemporaryDirectory()
+    try:
+        cfg_path = str(Path(tmpdir.name) / "dial.json")
+        Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
+        err_path = str(Path(tmpdir.name) / "dial-stderr.log")
+        try:
+            err_handle = open(err_path, "ab")
+        except OSError:
+            err_handle = None
+        try:
+            proc = subprocess.Popen(
+                [singbox_bin, "run", "-c", cfg_path],
+                stdout=subprocess.DEVNULL,
+                stderr=err_handle or subprocess.DEVNULL)
+        except OSError:
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            print(f"verify failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
+                  f"cannot start {singbox_bin}", flush=True)
+            return (None, None)
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                fetched = _socks5_get_text(
+                    "127.0.0.1", port, "api.ipify.org", 443, "/?format=text",
+                    timeout=min(10, max(1, remaining)))
+                if (fetched is not None and fetched[0] == 200
+                        and _looks_like_ipv4(fetched[1])):
+                    return (fetched[1].decode("ascii").strip(), fetched[2])
+                if proc.poll() is not None:
+                    break  # sing-box died; the tunnel will never come up
+                time.sleep(poll_interval)
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            _log_dial_failure(endpoint, err_path)
+            return (None, None)
         finally:
             try:
                 proc.terminate()
