@@ -361,3 +361,26 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker rm -f vpngate-test || true
+
+  deploy-railway:
+    name: Deploy to Railway
+    needs: railway-build
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Railway CLI
+        # Pinned: CLI 5.3.0+ ignores RAILWAY_TOKEN in CI ("Not signed in" regression).
+        # Railway service must use Dockerfile.railway as its builder (Dashboard setting).
+        run: npm install -g @railway/cli@5.2.0
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          RAILWAY_ENVIRONMENT: ${{ secrets.RAILWAY_ENVIRONMENT }}
+        run: |
+          [ -n "$RAILWAY_TOKEN" ] || { echo "::error::Missing RAILWAY_TOKEN secret. Create a project token in the Railway Dashboard and add it as a repo secret named RAILWAY_TOKEN."; exit 1; }
+          [ -n "$RAILWAY_PROJECT_ID" ] || { echo "::error::Missing RAILWAY_PROJECT_ID secret. Add the Railway project ID as a repo secret named RAILWAY_PROJECT_ID."; exit 1; }
+          [ -n "$RAILWAY_SERVICE_ID" ] || { echo "::error::Missing RAILWAY_SERVICE_ID secret. Add the Railway service ID as a repo secret named RAILWAY_SERVICE_ID."; exit 1; }
+          railway up --project "$RAILWAY_PROJECT_ID" --environment "${RAILWAY_ENVIRONMENT:-production}" --service "$RAILWAY_SERVICE_ID" --detach -m "deploy ${GITHUB_SHA}"

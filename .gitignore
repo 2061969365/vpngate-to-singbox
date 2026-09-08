@@ -1,4 +1,5 @@
 __pycache__/
+.superpowers/
 *.pyc
 out.json
 live_snapshot.csv
