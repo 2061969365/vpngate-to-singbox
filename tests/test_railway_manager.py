@@ -755,6 +755,51 @@ class EnvValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             default_fetch("http://example.com/x.csv", timeout=1)
 
+    def test_dial_workers_defaults_to_ten(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(10, config["dial_workers"])
+
+    def test_dial_workers_env_override(self) -> None:
+        config = build_config_from_env(self._env(DIAL_WORKERS="4"))
+
+        self.assertEqual(4, config["dial_workers"])
+
+    def test_data_dir_prefers_railway_volume(self) -> None:
+        config = build_config_from_env(
+            self._env(RAILWAY_VOLUME_MOUNT_PATH="/data"))
+
+        self.assertEqual("/data", config["data_dir"])
+
+    def test_explicit_data_dir_beats_railway_volume(self) -> None:
+        config = build_config_from_env(self._env(
+            DATA_DIR="/custom", RAILWAY_VOLUME_MOUNT_PATH="/data"))
+
+        self.assertEqual("/custom", config["data_dir"])
+
+
+class DialWorkersPlumbingTests(unittest.TestCase):
+    """refresh_once must forward the configured dial concurrency."""
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def test_refresh_once_forwards_dial_workers(self) -> None:
+        seen = {}
+        manager = RailwayManager(
+            port=0, mixed_port=get_free_port(), start_singbox=False,
+            auto_refresh=False, fetch_on_start=False,
+            admin_token=self.TOKEN, dial_workers=10,
+            config_path=f"/tmp/railway-dw-{id(self)}.json",
+            nodes_path=f"/tmp/railway-dw-{id(self)}-nodes.json",
+            state_path=f"/tmp/railway-dw-{id(self)}-state.json")
+        try:
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            side_effect=lambda *a, **k: seen.update(k) or []):
+                manager.refresh_once(fetcher=lambda url, timeout: "x")
+        finally:
+            manager.stop()
+
+        self.assertEqual(10, seen.get("dial_workers"))
+
 
 class SwitchTests(unittest.TestCase):
     TOKEN = "test-admin-token-0123456789abcdef"

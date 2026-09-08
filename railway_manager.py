@@ -158,7 +158,7 @@ table.bench td.op a:hover{text-decoration:underline}
 </div>
 <div class="glass-card">
 <h2>可用节点</h2>
-<p class="desc">按隧道延迟排序。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。</p>
+<p class="desc">默认显示 Top30 实测节点（自动刷新只测前 30）。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底；要测全部点「全量真测」。</p>
 <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" placeholder="搜索 tag / 国家…" oninput="refresh()"><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button></div>
 <div id="pills"></div>
 <div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill"></div></div><div class="txt" id="probe-txt"></div></div>
@@ -466,7 +466,9 @@ def build_config_from_env(env: dict) -> dict:
         "refresh_seconds": int(env.get("REFRESH_SECONDS", "1200")),
         "limit": int(env.get("LIMIT", "0")),
         "real_topk": int(env.get("REAL_TOPK", "30")),
-        "data_dir": env.get("DATA_DIR", "."),
+        "dial_workers": int(env.get("DIAL_WORKERS", "10")),
+        "data_dir": env.get("DATA_DIR")
+        or env.get("RAILWAY_VOLUME_MOUNT_PATH") or ".",
         "vless_uuid": env.get("VLESS_UUID", ""),
         "vless_direct_port": int(env.get("VLESS_DIRECT_PORT", "8080")),
         "vless_chain_port": int(env.get("VLESS_CHAIN_PORT", "8082")),
@@ -527,6 +529,7 @@ class RailwayManager:
         limit: int | None = 0,
         real_topk: int = 0,
         dial_fn=None,
+        dial_workers: int = 10,
         verify_fn=None,
         vless_uuid: str = "",
         vless_direct_port: int = 8080,
@@ -556,6 +559,7 @@ class RailwayManager:
         self.dial_fn = (dial_fn if dial_fn is not None else
                         (lambda node: measure_real_latency(
                             node["endpoint"], self.singbox_bin)))
+        self.dial_workers = dial_workers
         self.verify_fn = (verify_fn if verify_fn is not None else
                           (lambda endpoint: measure_exit_ip(
                               endpoint, self.singbox_bin)))
@@ -1135,6 +1139,7 @@ class RailwayManager:
                                       probe_pool=probe_pool,
                                        probe_fn=lambda h, p: probe_tcp_latency(h, p, 5),
                                        real_topk=self.real_topk, dial_fn=self.dial_fn,
+                                       dial_workers=self.dial_workers,
                                        singbox_bin=self.singbox_bin)
             if not nodes:
                 return self._refresh_failed("no reachable nodes, kept previous")
@@ -1460,6 +1465,7 @@ def main() -> int:
         refresh_seconds=cfg["refresh_seconds"],
         limit=cfg["limit"],
         real_topk=cfg["real_topk"],
+        dial_workers=cfg["dial_workers"],
         vless_uuid=cfg["vless_uuid"],
         vless_direct_port=cfg["vless_direct_port"],
         vless_chain_port=cfg["vless_chain_port"],
