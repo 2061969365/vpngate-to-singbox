@@ -440,6 +440,10 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     proc.kill()
                 except OSError:
                     pass
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             if err_handle is not None:
                 try:
                     err_handle.close()
@@ -510,6 +514,10 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                 try:
                     proc.kill()
                 except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
                     pass
             if err_handle is not None:
                 try:

@@ -1457,5 +1457,218 @@ class VerifyApiTests(unittest.TestCase):
         self.assertIn("503", status_line)
 
 
+class ProcessHygieneTests(unittest.TestCase):
+    """P0: no blocking under lock, no silent supervise death, no zombies."""
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def _manager(self, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
+                        auto_refresh=False, fetch_on_start=False,
+                        admin_token=self.TOKEN,
+                        config_path=f"/tmp/railway-hyg-{id(self)}.json",
+                        nodes_path=f"/tmp/railway-hyg-{id(self)}-nodes.json",
+                        state_path=f"/tmp/railway-hyg-{id(self)}-state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def test_restart_survives_popen_failure(self) -> None:
+        manager = self._manager()
+        try:
+            with mock.patch("railway_manager.subprocess.Popen",
+                            side_effect=OSError("noexec")):
+                manager._restart_singbox()  # must not raise
+            self.assertIsNone(manager._singbox_proc)
+        finally:
+            manager.stop()
+
+    def test_terminate_waits_after_kill(self) -> None:
+        calls = []
+
+        class FakeProc:
+            def terminate(self):
+                calls.append("terminate")
+
+            def wait(self, timeout=None):
+                calls.append(("wait", timeout))
+                if len([c for c in calls if isinstance(c, tuple)]) == 1:
+                    raise subprocess.TimeoutExpired("fake", timeout)
+                return 0
+
+            def kill(self):
+                calls.append("kill")
+
+            def poll(self):
+                return None
+
+        manager = self._manager()
+        try:
+            manager._singbox_proc = FakeProc()
+            manager._terminate_singbox()
+        finally:
+            manager.stop()
+
+        self.assertEqual(["terminate", ("wait", 5), "kill", ("wait", 5)],
+                         calls)
+
+    def test_check_runs_without_holding_lock(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [{"server": "203.0.113.11", "server_port": 443,
+                               "endpoint": {"tag": "vpngate-0"}}]
+            verdict = {}
+
+            def _check(path):
+                # RLock is reentrant on THIS thread, so probe from another
+                # thread: if _apply_config still holds the lock, this fails.
+                # Acquire AND release on the probe thread: a leaked hold
+                # by a dead thread would wedge every later acquire.
+
+                def _probe():
+                    acquired = manager._lock.acquire(blocking=False)
+                    verdict["free"] = acquired
+                    if acquired:
+                        manager._lock.release()
+
+                probe = threading.Thread(target=_probe)
+                probe.start()
+                probe.join(timeout=10)
+                return True
+
+            with mock.patch("railway_manager.build_singbox_config",
+                            return_value={}), \
+                 mock.patch.object(manager, "_check_config",
+                                   side_effect=_check) as checked, \
+                 mock.patch.object(manager, "_restart_singbox"):
+                ok = manager._apply_config("auto")
+        finally:
+            manager.stop()
+
+        self.assertTrue(ok)
+        self.assertTrue(checked.called)
+        self.assertTrue(verdict.get("free"), "lock held during check")
+
+    def test_cloudflared_restart_reaps_old_proc(self) -> None:
+        manager = self._manager(tunnel_token="t-o-k-e-n")
+        reaped = []
+
+        class OldProc:
+            def terminate(self):
+                reaped.append("terminate")
+
+            def wait(self, timeout=None):
+                reaped.append(("wait", timeout))
+                return 0
+
+            def kill(self):
+                reaped.append("kill")
+
+            def poll(self):
+                return 0
+
+        manager._cloudflared_proc = OldProc()
+        try:
+            with mock.patch("railway_manager.shutil.which",
+                            return_value="/usr/local/bin/cloudflared"), \
+                 mock.patch("railway_manager.subprocess.Popen") as popen:
+                started = manager._start_cloudflared()
+                current = manager._cloudflared_proc
+                child = popen.return_value
+        finally:
+            with mock.patch("railway_manager.subprocess.Popen"):
+                manager.stop()
+
+        self.assertTrue(started)
+        self.assertIs(child, current)
+        self.assertIn("terminate", reaped)
+
+
+class HalfPacketTests(unittest.TestCase):
+    """P0: TCP-fragmented request heads must wait for more bytes."""
+
+    class FakeClient:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+            self.sent = b""
+
+        def settimeout(self, timeout):
+            pass
+
+        def recv(self, size):
+            if not self._chunks:
+                return b""
+            return self._chunks.pop(0)
+
+        def sendall(self, data):
+            self.sent += data
+
+        def close(self):
+            pass
+
+    def _manager(self):
+        return RailwayManager(
+            port=0, mixed_port=get_free_port(), start_singbox=False,
+            auto_refresh=False, fetch_on_start=False,
+            admin_token="test-admin-token-0123456789abcdef",
+            config_path=f"/tmp/railway-half-{id(self)}.json",
+            nodes_path=f"/tmp/railway-half-{id(self)}-nodes.json",
+            state_path=f"/tmp/railway-half-{id(self)}-state.json")
+
+    def test_split_get_reaches_http(self) -> None:
+        manager = self._manager()
+        try:
+            client = self.FakeClient([
+                b"GE",
+                b"T /api/status HTTP/1.1\r\nHost: x\r\n\r\n",
+            ])
+            manager._handle_client(client)
+        finally:
+            manager.stop()
+
+        self.assertIn(b"401", client.sent)
+
+    def test_garbage_still_closes_silently(self) -> None:
+        manager = self._manager()
+        try:
+            client = self.FakeClient([b"XYZ"])
+            manager._handle_client(client)
+        finally:
+            manager.stop()
+
+        self.assertEqual(b"", client.sent)
+
+
+class PipeIdleTests(unittest.TestCase):
+    """P0: forwarding ends on EOF or idle timeout instead of hanging."""
+
+    def test_forward_returns_on_timeout(self) -> None:
+        a, b = socket.socketpair()
+        try:
+            a.settimeout(0.2)
+            from railway_manager import _forward
+            self.assertEqual(0, _forward(a, b))
+        finally:
+            a.close()
+            b.close()
+
+    def test_forward_copies_then_eof(self) -> None:
+        from railway_manager import _forward
+        # NOTE: feeder must be CLOSED after sending. Leaving both ends
+        # open turns the pair into an echo chamber: _forward(a->b) writes
+        # into b whose output feeds back into a, ping-ponging forever.
+        # close() delivers queued bytes before FIN, so EOF is deterministic.
+        src, feeder = socket.socketpair()
+        dst, _sink = socket.socketpair()
+        try:
+            feeder.sendall(b"hello")
+            feeder.close()
+            self.assertEqual(5, _forward(src, dst))
+        finally:
+            for sock in (src, feeder, dst, _sink):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

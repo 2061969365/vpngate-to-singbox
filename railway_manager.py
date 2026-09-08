@@ -47,6 +47,7 @@ HTTP_METHODS = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ",
                 b"OPTIONS ", b"PATCH ")
 MIN_PROXY_PASS_LEN = 16
 MIN_ADMIN_TOKEN_LEN = 16
+PIPE_IDLE_TIMEOUT = 300
 HEALTH_CHECK_INTERVAL = 60
 PINNED_FAIL_THRESHOLD = 3
 SUPERVISE_INTERVAL = 10
@@ -489,11 +490,14 @@ def _http_response(status: str, content_type: str, body: bytes) -> bytes:
 
 
 def _forward(source: socket.socket, dest: socket.socket) -> int:
-    """Forward until EOF, returning bytes moved."""
+    """Forward until EOF/error/idle-timeout, returning bytes moved."""
     moved = 0
     try:
         while True:
-            chunk = source.recv(65536)
+            try:
+                chunk = source.recv(65536)
+            except socket.timeout:
+                break
             if not chunk:
                 break
             dest.sendall(chunk)
@@ -501,6 +505,39 @@ def _forward(source: socket.socket, dest: socket.socket) -> int:
     except OSError:
         pass
     return moved
+
+
+def _reap_process(proc, handle=None) -> None:
+    """Terminate and reap a child process. Must run WITHOUT holding locks:
+    wait() can block for seconds and would stall health/API handlers."""
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _is_partial_token(data: bytes) -> bool:
+    """True when data could still become a known first token (TCP split)."""
+    if not data:
+        return False
+    for token in HTTP_METHODS + (b"CONNECT ",):
+        if len(data) < len(token) and token.startswith(data):
+            return True
+    return False
 
 
 def _write_private_json(path: str, obj: dict) -> None:
@@ -675,6 +712,22 @@ class RailwayManager:
             if not peek:
                 return
             kind = classify_first_bytes(peek)
+            if kind == "unknown" and _is_partial_token(peek):
+                # TCP split the request head ("GE"+"T /..."): wait for
+                # more bytes instead of dropping a valid connection.
+                deadline = time.monotonic() + 5
+                while (len(peek) < 4096
+                       and time.monotonic() < deadline):
+                    try:
+                        chunk = client.recv(4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    peek += chunk
+                    kind = classify_first_bytes(peek)
+                    if kind != "unknown" or not _is_partial_token(peek):
+                        break
             if kind in ("socks5", "http-connect"):
                 with self._lock:
                     self.status["traffic"]["connections"] += 1
@@ -839,6 +892,8 @@ class RailwayManager:
             backend = socket.create_connection(("127.0.0.1", self.mixed_port), timeout=10)
         except OSError:
             return
+        client.settimeout(PIPE_IDLE_TIMEOUT)
+        backend.settimeout(PIPE_IDLE_TIMEOUT)
         try:
             backend.sendall(peek)
             up = [0]
@@ -855,7 +910,14 @@ class RailwayManager:
             first.start()
             second.start()
             first.join()
-            second.join()
+            # One direction ended: unblock the other so join() below
+            # always returns instead of parking threads forever.
+            for sock in (client, backend):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            second.join(timeout=10)
             with self._lock:
                 self.status["traffic"]["bytes_up"] += up[0] + len(peek)
                 self.status["traffic"]["bytes_down"] += down[0]
@@ -1095,41 +1157,52 @@ class RailwayManager:
         """Write checked config atomically and restart sing-box. Returns success."""
         with self._lock:
             endpoints = [n["endpoint"] for n in self._nodes]
-            config = build_singbox_config(
-                endpoints, "127.0.0.1", self.mixed_port,
-                mixed_users=[(self.username, self.password)], final=final,
-                vless_uuid=self.vless_uuid or None,
-                vless_direct_port=self.vless_direct_port,
-                vless_chain_port=self.vless_chain_port)
-            tmp_path = f"{self.config_path}.tmp-{os.getpid()}"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(config, handle, indent=2)
-                handle.write("\n")
-            if not self._check_config(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                return False
+            username, password = self.username, self.password
+            mixed_port = self.mixed_port
+            vless_uuid = self.vless_uuid or None
+            direct_port = self.vless_direct_port
+            chain_port = self.vless_chain_port
+            config_path = self.config_path
+            last_good_path = self.last_good_path
+            want_singbox = self.want_singbox
+        config = build_singbox_config(
+            endpoints, "127.0.0.1", mixed_port,
+            mixed_users=[(username, password)], final=final,
+            vless_uuid=vless_uuid,
+            vless_direct_port=direct_port,
+            vless_chain_port=chain_port)
+        # Everything below runs WITHOUT the lock: `sing-box check` may
+        # block ~30s and restart waits on the old process; holding the
+        # lock here would stall /healthz and every /api/* handler.
+        tmp_path = f"{config_path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+        if not self._check_config(tmp_path):
             try:
-                os.chmod(tmp_path, 0o600)
+                os.unlink(tmp_path)
             except OSError:
                 pass
-            os.replace(tmp_path, self.config_path)
+            return False
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, config_path)
+        try:
+            with open(config_path, "rb") as src:
+                payload = src.read()
+            with open(last_good_path, "wb") as dst:
+                dst.write(payload)
             try:
-                with open(self.config_path, "rb") as src:
-                    payload = src.read()
-                with open(self.last_good_path, "wb") as dst:
-                    dst.write(payload)
-                try:
-                    os.chmod(self.last_good_path, 0o600)
-                except OSError:
-                    pass
+                os.chmod(last_good_path, 0o600)
             except OSError:
                 pass
-            if self.want_singbox:
-                self._restart_singbox()
-            return True
+        except OSError:
+            pass
+        if want_singbox:
+            self._restart_singbox()
+        return True
 
     def refresh_once(self, fetcher=None, probe_pool: int = 0) -> bool:
         try:
@@ -1338,8 +1411,11 @@ class RailwayManager:
 
     def _restart_singbox(self) -> None:
         with self._lock:
-            self._terminate_singbox_locked()
+            old_proc, self._singbox_proc = self._singbox_proc, None
+            old_handle, self._stderr_handle = self._stderr_handle, None
             stderr_path = f"{self.config_path}.stderr.log"
+            config_path = self.config_path
+            singbox_bin = self.singbox_bin
             try:
                 if (os.path.exists(stderr_path)
                         and os.path.getsize(stderr_path) > 200 * 1024):
@@ -1347,42 +1423,35 @@ class RailwayManager:
             except OSError:
                 pass
             try:
-                self._stderr_handle = open(stderr_path, "ab")
+                new_handle = open(stderr_path, "ab")
             except OSError:
-                self._stderr_handle = None
-            self._singbox_proc = subprocess.Popen(
-                [self.singbox_bin, "run", "-c", self.config_path],
-                stdout=subprocess.DEVNULL,
-                stderr=self._stderr_handle or subprocess.DEVNULL,
-            )
+                new_handle = None
+            try:
+                new_proc = subprocess.Popen(
+                    [singbox_bin, "run", "-c", config_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=new_handle or subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                print(f"sing-box start failed: {exc}", flush=True)
+                new_proc = None
+                if new_handle is not None:
+                    try:
+                        new_handle.close()
+                    except OSError:
+                        pass
+                    new_handle = None
+            self._singbox_proc = new_proc
+            self._stderr_handle = new_handle
+        # Reap outside the lock; the supervise loop retries a dead proc
+        # with backoff, so a failed spawn is recovered, not fatal.
+        _reap_process(old_proc, old_handle)
 
     def _terminate_singbox(self) -> None:
         with self._lock:
-            self._terminate_singbox_locked()
-
-    def _terminate_singbox_locked(self) -> None:
-        proc, self._singbox_proc = self._singbox_proc, None
-        handle, self._stderr_handle = self._stderr_handle, None
-        if proc is None:
-            if handle is not None:
-                try:
-                    handle.close()
-                except OSError:
-                    pass
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
+            proc, self._singbox_proc = self._singbox_proc, None
+            handle, self._stderr_handle = self._stderr_handle, None
+        _reap_process(proc, handle)
 
     # -- cloudflare tunnel (soft-optional) -------------------------------
     def _start_cloudflared(self) -> bool:
@@ -1406,7 +1475,7 @@ class RailwayManager:
                       flush=True)
                 return False
             try:
-                self._cloudflared_proc = subprocess.Popen(
+                new_proc = subprocess.Popen(
                     [binary, "tunnel", "--protocol", "quic", "--no-autoupdate",
                      "run", "--token", self.tunnel_token],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1414,24 +1483,17 @@ class RailwayManager:
             except OSError as exc:
                 self.status["tunnel"] = {"state": "dead", "error": str(exc)}
                 return False
+            old_proc, self._cloudflared_proc = self._cloudflared_proc, new_proc
             self.status["tunnel"] = {"state": "running", "since": _now_iso()}
             print("cloudflared tunnel started", flush=True)
-            return True
+        _reap_process(old_proc)
+        return True
 
     def _terminate_cloudflared(self) -> None:
         with self._lock:
             proc, self._cloudflared_proc = self._cloudflared_proc, None
-            if proc is None:
-                return
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
             self.status["tunnel"] = {"state": "off"}
+        _reap_process(proc)
 
     def tail_singbox_stderr(self, max_lines: int = 20) -> str:
         try:
