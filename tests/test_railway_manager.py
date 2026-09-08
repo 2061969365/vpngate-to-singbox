@@ -348,6 +348,15 @@ class FullProbeTests(unittest.TestCase):
                          [ep["real_latency_ms"]
                           for ep in manager.status["endpoints"]])
 
+    def test_default_dial_fn_measures_real(self) -> None:
+        manager = self._manager()
+        try:
+            dial_fn = manager.dial_fn
+        finally:
+            manager.stop()
+
+        self.assertIsNotNone(dial_fn)
+
 
 class AuthTests(unittest.TestCase):
     TOKEN = "test-admin-token-0123456789abcdef"
@@ -426,6 +435,11 @@ class AstraUiTests(unittest.TestCase):
     def test_dark_theme_and_nav_present(self) -> None:
         self.assertIn('id="topnav"', UI_HTML)
         self.assertIn("background:#000", UI_HTML)
+
+    def test_full_probe_button_present(self) -> None:
+        self.assertIn('id="btn-fullprobe"', UI_HTML)
+        self.assertIn("fullProbeNow", UI_HTML)
+        self.assertIn("/api/full_probe", UI_HTML)
 
 
 class EnvValidationTests(unittest.TestCase):

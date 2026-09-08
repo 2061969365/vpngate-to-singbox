@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 
 from vpngate_to_singbox import (
     build_singbox_config,
+    measure_real_latency,
     nodes_to_endpoints,
     primary_server,
     probe_tcp_latency,
@@ -73,6 +74,7 @@ body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Se
 .actions{display:flex;gap:12px;margin-top:20px}
 #btn-verify{background:#fff;color:#000;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none}
 #btn-refresh{border:1px solid #555;border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:transparent;cursor:pointer}
+#btn-fullprobe{border:1px solid #8ab4ff;border-radius:999px;padding:10px 26px;font-size:14px;color:#8ab4ff;background:transparent;cursor:pointer}
 .section{padding:44px 32px;border-top:1px solid #1c1c1c;max-width:1200px}
 .section h2{font-size:26px;font-weight:600;margin-bottom:12px}
 .section p{color:#b5b5b5;font-size:14px;line-height:1.7;max-width:800px;margin-bottom:16px}
@@ -92,7 +94,7 @@ table.bench td.op a{color:#8ab4ff;cursor:pointer;text-decoration:none}
 <div id="hero-kicker">—<br>—</div>
 <p id="hero-sub">loading…</p>
 <div id="pills"></div>
-<div class="actions"><button id="btn-verify" onclick="verifyNow()">验证出口 IP</button><button id="btn-refresh" onclick="refreshNow()">刷新节点</button></div>
+<div class="actions"><button id="btn-verify" onclick="verifyNow()">验证出口 IP</button><button id="btn-refresh" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" onclick="fullProbeNow()">全量真测</button></div>
 </div>
 <div class="section">
 <h2>可用节点</h2>
@@ -135,7 +137,8 @@ async function refresh() {
       "</td><td class='hl'>" + fmtMs(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
       "<td class='op'><a onclick='probeOne(" + e.tag + ")'>测速</a> <a onclick='switchTag(" + e.tag + ")'>切换</a></td></tr>").join("");
     document.getElementById("history-line").textContent =
-      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error;
+      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error +
+      (s.full_probe && s.full_probe.state !== "idle" ? " · 全量真测: " + s.full_probe.state + " " + s.full_probe.done + "/" + s.full_probe.total : "");
     document.getElementById("foot-status").textContent = "uptime " + s.uptime_seconds + "s · refresh " + s.refresh_ok + "/" + s.refresh_fail;
   } catch (e) {
     document.getElementById("hero-sub").textContent = "status fetch failed: " + e;
@@ -151,6 +154,10 @@ async function probeOne(tag) {
 }
 async function refreshNow() {
   await api("/api/refresh", "POST", {});
+  refresh();
+}
+async function fullProbeNow() {
+  await api("/api/full_probe", "POST", {});
   refresh();
 }
 async function verifyNow() {
@@ -287,7 +294,9 @@ class RailwayManager:
         self.refresh_seconds = refresh_seconds
         self.limit = limit
         self.real_topk = real_topk
-        self.dial_fn = dial_fn
+        self.dial_fn = (dial_fn if dial_fn is not None else
+                        (lambda node: measure_real_latency(
+                            node["endpoint"], self.singbox_bin)))
         self.config_path = config_path
         self.nodes_path = nodes_path
         self.state_path = state_path

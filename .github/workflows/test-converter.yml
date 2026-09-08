@@ -413,8 +413,33 @@ jobs:
             fi
             sleep 15
           done
-          echo "container log tail:"; docker logs vpngate-trial 2>&1 | tail -n 30
-          echo "exit IP never differed from direct IP"; exit 1
+            echo "container log tail:"; docker logs vpngate-trial 2>&1 | tail -n 30
+            echo "exit IP never differed from direct IP"; exit 1
+      - name: Manual full probe via container API
+        run: |
+          curl -m 10 -s -X POST -H "Authorization: Bearer trial-admin-token-0123456789" \
+            http://127.0.0.1:8080/api/full_probe | grep -q '"accepted": true' || {
+            echo "full_probe not accepted"; docker logs vpngate-trial 2>&1 | tail -n 20; exit 1; }
+          echo "full_probe accepted, polling for done (up to ~10min)..."
+          for i in $(seq 1 40); do
+            curl -m 10 -s -H "Authorization: Bearer trial-admin-token-0123456789" \
+              http://127.0.0.1:8080/api/status -o /tmp/trial-full.json
+            if python3 -c "import json;exit(0 if json.load(open('/tmp/trial-full.json'))['full_probe']['state']=='done' else 1)"; then
+              echo "full_probe done after ~$((i * 15))s"; break
+            fi
+            sleep 15
+          done
+          python3 - <<'EOF'
+          import json
+          status = json.load(open("/tmp/trial-full.json"))
+          fp = status["full_probe"]
+          print(f"full_probe: state={fp['state']} done={fp['done']}/{fp['total']}")
+          assert fp["state"] == "done" and fp["done"] == fp["total"] and fp["total"] > 0, \
+              "trial: manual full probe did not finish every node"
+          measured = [e for e in status["endpoints"] if e.get("real_latency_ms") is not None]
+          print(f"trial: {len(measured)}/{len(status['endpoints'])} endpoints with real latency after full probe")
+          assert measured, "trial: full probe filled no real latency"
+          EOF
       - name: Cleanup
         if: always()
         run: docker rm -f vpngate-trial || true

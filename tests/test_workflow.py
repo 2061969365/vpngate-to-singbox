@@ -25,6 +25,9 @@ class TrialRunJobTests(unittest.TestCase):
         self.assertIn("socks5h", self.text)
         self.assertIn("api.ipify.org", self.text)
 
+    def test_trial_run_exercises_full_probe(self) -> None:
+        self.assertIn("full_probe", self.text)
+
     def test_no_railway_deploy_job(self) -> None:
         self.assertNotIn("deploy-railway:", self.text)
 
