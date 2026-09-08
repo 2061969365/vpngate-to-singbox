@@ -544,6 +544,11 @@ def build_singbox_config(
     mixed_port: int | None = None,
     mixed_users: list[tuple[str, str]] | None = None,
     final: str = "auto",
+    vless_uuid: str | None = None,
+    vless_direct_port: int = 8080,
+    vless_direct_path: str = "/ws-node",
+    vless_chain_port: int = 8082,
+    vless_chain_path: str = "/ws-chain",
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -553,6 +558,12 @@ def build_singbox_config(
     because a local direct outlet always wins urltest on speed and would
     silently route all serving traffic around the VPN. "direct" stays in the
     manual "proxy" selector as an explicit user-chosen fallback.
+
+    When vless_uuid is set, two VLESS+WS inbounds are added for Cloudflare
+    Tunnel use: "vless-direct" (Railway-local exit via "direct") and
+    "vless-chain" (VPNGate exit via the "chain-socks" socks5 outbound that
+    points at the mixed inbound). Route rules split by inbound tag, so the
+    two paths never mix. Requires the mixed inbound (the chain target).
     """
     tags = [ep["tag"] for ep in endpoints]
     config: dict = {
@@ -573,6 +584,29 @@ def build_singbox_config(
             inbound["users"] = [{"username": user, "password": password}
                                 for user, password in mixed_users]
         config["inbounds"] = [inbound]
+    if vless_uuid is not None:
+        if mixed_listen is None or mixed_port is None:
+            raise ValueError("vless inbounds need the mixed inbound as chain target")
+        config.setdefault("inbounds", []).extend([
+            {"type": "vless", "tag": "vless-direct",
+             "listen": "0.0.0.0", "listen_port": vless_direct_port,
+             "users": [{"uuid": vless_uuid}],
+             "transport": {"type": "ws", "path": vless_direct_path}},
+            {"type": "vless", "tag": "vless-chain",
+             "listen": "0.0.0.0", "listen_port": vless_chain_port,
+             "users": [{"uuid": vless_uuid}],
+             "transport": {"type": "ws", "path": vless_chain_path}},
+        ])
+        chain_socks: dict = {"type": "socks", "tag": "chain-socks",
+                             "server": "127.0.0.1", "server_port": mixed_port,
+                             "version": "5"}
+        if mixed_users:
+            chain_socks["username"], chain_socks["password"] = mixed_users[0]
+        config["outbounds"].append(chain_socks)
+        config["route"]["rules"] = [
+            {"inbound": "vless-direct", "outbound": "direct"},
+            {"inbound": "vless-chain", "outbound": "chain-socks"},
+        ]
     return config
 
 

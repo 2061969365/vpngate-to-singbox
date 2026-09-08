@@ -894,5 +894,87 @@ class ColdStartTests(unittest.TestCase):
             self.assertEqual([], manager.status["endpoints"])
 
 
+class TunnelTests(unittest.TestCase):
+    def _paths(self, tmpdir: str) -> dict:
+        return {"config_path": os.path.join(tmpdir, "singbox.json"),
+                "nodes_path": os.path.join(tmpdir, "nodes.json"),
+                "state_path": os.path.join(tmpdir, "state.json")}
+
+    def _manager(self, tmpdir: str, **kwargs) -> RailwayManager:
+        defaults = dict(port=0, mixed_port=get_free_port(),
+                        start_singbox=False, auto_refresh=False,
+                        fetch_on_start=False)
+        defaults.update(kwargs)
+        return RailwayManager(**defaults, **self._paths(tmpdir))
+
+    def test_env_defaults_leave_tunnel_off(self) -> None:
+        cfg = build_config_from_env({"PROXY_PASS": "0123456789abcdef"})
+        self.assertEqual("", cfg["vless_uuid"])
+        self.assertEqual("", cfg["tunnel_token"])
+
+    def test_env_picks_up_uuid_and_token(self) -> None:
+        cfg = build_config_from_env({"PROXY_PASS": "0123456789abcdef",
+                                     "VLESS_UUID": "u-u-i-d",
+                                     "TUNNEL_TOKEN": "t-o-k-e-n"})
+        self.assertEqual("u-u-i-d", cfg["vless_uuid"])
+        self.assertEqual("t-o-k-e-n", cfg["tunnel_token"])
+
+    def test_apply_config_includes_vless_when_uuid_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, vless_uuid="u-u-i-d")
+            node = {"server": "203.0.113.1", "server_port": 443,
+                    "endpoint": ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")}
+            manager._nodes = [node]
+            with _fake_singbox(), \
+                 mock.patch.object(RailwayManager, "_restart_singbox"):
+                self.assertTrue(manager._apply_config(final="auto"))
+            written = _read_json(manager.config_path)
+            tags = [i["tag"] for i in written["inbounds"]]
+            self.assertIn("vless-direct", tags)
+            self.assertIn("vless-chain", tags)
+
+    def test_apply_config_skips_vless_without_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            node = {"server": "203.0.113.1", "server_port": 443,
+                    "endpoint": ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")}
+            manager._nodes = [node]
+            with _fake_singbox(), \
+                 mock.patch.object(RailwayManager, "_restart_singbox"):
+                self.assertTrue(manager._apply_config(final="auto"))
+            written = _read_json(manager.config_path)
+            tags = [i["tag"] for i in written.get("inbounds", [])]
+            self.assertNotIn("vless-direct", tags)
+
+    def test_start_cloudflared_without_token_skips_softly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, tunnel_token="")
+            with mock.patch("railway_manager.subprocess.Popen") as popen:
+                self.assertFalse(manager._start_cloudflared())
+                popen.assert_not_called()
+            self.assertIsNone(manager._cloudflared_proc)
+            self.assertEqual("no-token", manager.status["tunnel"]["state"])
+
+    def test_start_cloudflared_missing_binary_skips_softly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, tunnel_token="t-o-k-e-n",
+                                    cloudflared_bin="/nonexistent/cloudflared")
+            with mock.patch("railway_manager.subprocess.Popen") as popen:
+                self.assertFalse(manager._start_cloudflared())
+                popen.assert_not_called()
+            self.assertEqual("no-binary", manager.status["tunnel"]["state"])
+
+    def test_start_cloudflared_spawns_process_with_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, tunnel_token="t-o-k-e-n")
+            with mock.patch("railway_manager.subprocess.Popen") as popen, \
+                 mock.patch("railway_manager.shutil.which",
+                            return_value="/usr/local/bin/cloudflared"):
+                self.assertTrue(manager._start_cloudflared())
+                args = popen.call_args[0][0]
+                self.assertIn("t-o-k-e-n", args)
+            self.assertEqual("running", manager.status["tunnel"]["state"])
+
+
 if __name__ == "__main__":
     unittest.main()

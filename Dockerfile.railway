@@ -2,6 +2,7 @@
 FROM python:3.11-slim
 
 ARG SINGBOX_VERSION=1.14.0
+ARG CLOUDFLARED_VERSION=2026.8.3
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -10,6 +11,9 @@ RUN apt-get update \
     && mv /tmp/sing-box-*/sing-box /usr/local/bin/sing-box \
     && chmod +x /usr/local/bin/sing-box \
     && sing-box version \
+    && curl -Ls -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+    && chmod +x /usr/local/bin/cloudflared \
+    && cloudflared --version \
     && rm -rf /tmp/sing-box-* /var/lib/apt/lists/*
 
 WORKDIR /app

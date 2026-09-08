@@ -22,6 +22,7 @@ import json
 import os
 import random
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -221,6 +222,11 @@ def build_config_from_env(env: dict) -> dict:
         "limit": int(env.get("LIMIT", "0")),
         "real_topk": int(env.get("REAL_TOPK", "30")),
         "data_dir": env.get("DATA_DIR", "."),
+        "vless_uuid": env.get("VLESS_UUID", ""),
+        "vless_direct_port": int(env.get("VLESS_DIRECT_PORT", "8080")),
+        "vless_chain_port": int(env.get("VLESS_CHAIN_PORT", "8082")),
+        "tunnel_token": env.get("TUNNEL_TOKEN", ""),
+        "cloudflared_bin": env.get("CLOUDFLARED_BIN", "cloudflared"),
     }
 
 
@@ -275,6 +281,11 @@ class RailwayManager:
         limit: int | None = 0,
         real_topk: int = 0,
         dial_fn=None,
+        vless_uuid: str = "",
+        vless_direct_port: int = 8080,
+        vless_chain_port: int = 8082,
+        tunnel_token: str = "",
+        cloudflared_bin: str = "cloudflared",
         config_path: str = "singbox-railway.json",
         nodes_path: str = "nodes.json",
         state_path: str = "state.json",
@@ -307,6 +318,12 @@ class RailwayManager:
         self.fetch_on_start = fetch_on_start
         self.retry_delays = retry_delays
         self.fetcher = fetcher or default_fetch
+        self.vless_uuid = vless_uuid
+        self.vless_direct_port = vless_direct_port
+        self.vless_chain_port = vless_chain_port
+        self.tunnel_token = tunnel_token
+        self.cloudflared_bin = cloudflared_bin
+        self._cloudflared_proc: subprocess.Popen | None = None
         self.preferred_tag: str | None = None
         self._nodes: list[dict] = []
         self._first_seen: dict[str, str] = {}
@@ -328,6 +345,7 @@ class RailwayManager:
             "proxy": f"127.0.0.1:{mixed_port}",
             "traffic": {"connections": 0, "bytes_up": 0, "bytes_down": 0},
             "full_probe": {"state": "idle", "done": 0, "total": 0},
+            "tunnel": {"state": "off"},
         }
         self._full_probe_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -354,6 +372,7 @@ class RailwayManager:
         threading.Thread(target=self._health_monitor_loop, daemon=True).start()
         if self.fetch_on_start:
             threading.Thread(target=self._initial_refresh, daemon=True).start()
+        self._start_cloudflared()
         print(f"listening on 0.0.0.0:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}",
               flush=True)
         return self.bound_port
@@ -376,6 +395,7 @@ class RailwayManager:
                 pass
             self._listener = None
         self._terminate_singbox()
+        self._terminate_cloudflared()
 
     # -- accept / dispatch ----------------------------------------------
     def _accept_loop(self) -> None:
@@ -672,6 +692,14 @@ class RailwayManager:
                 restart_now = now >= self._retry_after - delay
             if restart_now:
                 self._restart_singbox()
+            # Relaunch the tunnel if it was wanted but died; _start_cloudflared
+            # soft-skips again when there is no token/binary.
+            with self._lock:
+                cf = self._cloudflared_proc
+                want_cf = bool(self.tunnel_token)
+                cf_alive = cf is not None and cf.poll() is None
+            if want_cf and not cf_alive:
+                self._start_cloudflared()
 
     def _health_monitor_loop(self) -> None:
         while not self._stop_event.wait(HEALTH_CHECK_INTERVAL):
@@ -754,7 +782,10 @@ class RailwayManager:
             endpoints = [n["endpoint"] for n in self._nodes]
             config = build_singbox_config(
                 endpoints, "127.0.0.1", self.mixed_port,
-                mixed_users=[(self.username, self.password)], final=final)
+                mixed_users=[(self.username, self.password)], final=final,
+                vless_uuid=self.vless_uuid or None,
+                vless_direct_port=self.vless_direct_port,
+                vless_chain_port=self.vless_chain_port)
             tmp_path = f"{self.config_path}.tmp-{os.getpid()}"
             with open(tmp_path, "w", encoding="utf-8") as handle:
                 json.dump(config, handle, indent=2)
@@ -964,6 +995,55 @@ class RailwayManager:
             except OSError:
                 pass
 
+    # -- cloudflare tunnel (soft-optional) -------------------------------
+    def _start_cloudflared(self) -> bool:
+        """Launch cloudflared for the VLESS+WS inbounds.
+
+        Soft-skips (returns False, never raises/exits) when TUNNEL_TOKEN is
+        empty or the binary is missing, so the proxy keeps working without a
+        tunnel. Ingress rules (hostnames -> 8080/8082) live in the Cloudflare
+        dashboard tunnel config, not here.
+        """
+        with self._lock:
+            if not self.tunnel_token:
+                self.status["tunnel"] = {"state": "no-token"}
+                print("cloudflared skipped: TUNNEL_TOKEN not set", flush=True)
+                return False
+            binary = shutil.which(self.cloudflared_bin)
+            if binary is None:
+                self.status["tunnel"] = {"state": "no-binary",
+                                         "binary": self.cloudflared_bin}
+                print(f"cloudflared skipped: binary {self.cloudflared_bin!r} not found",
+                      flush=True)
+                return False
+            try:
+                self._cloudflared_proc = subprocess.Popen(
+                    [binary, "tunnel", "--protocol", "quic", "--no-autoupdate",
+                     "run", "--token", self.tunnel_token],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                self.status["tunnel"] = {"state": "dead", "error": str(exc)}
+                return False
+            self.status["tunnel"] = {"state": "running", "since": _now_iso()}
+            print("cloudflared tunnel started", flush=True)
+            return True
+
+    def _terminate_cloudflared(self) -> None:
+        with self._lock:
+            proc, self._cloudflared_proc = self._cloudflared_proc, None
+            if proc is None:
+                return
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            self.status["tunnel"] = {"state": "off"}
+
     def tail_singbox_stderr(self, max_lines: int = 20) -> str:
         try:
             with open(f"{self.config_path}.stderr.log", "rb") as handle:
@@ -996,6 +1076,11 @@ def main() -> int:
         refresh_seconds=cfg["refresh_seconds"],
         limit=cfg["limit"],
         real_topk=cfg["real_topk"],
+        vless_uuid=cfg["vless_uuid"],
+        vless_direct_port=cfg["vless_direct_port"],
+        vless_chain_port=cfg["vless_chain_port"],
+        tunnel_token=cfg["tunnel_token"],
+        cloudflared_bin=cfg["cloudflared_bin"],
         config_path=os.path.join(data_dir, "singbox-railway.json"),
         nodes_path=os.path.join(data_dir, "nodes.json"),
         state_path=os.path.join(data_dir, "state.json"),
