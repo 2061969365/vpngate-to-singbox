@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from vpngate_to_singbox import (
     build_singbox_config,
     nodes_to_endpoints,
+    primary_server,
     probe_tcp_latency,
     snapshot_to_nodes,
 )
@@ -474,7 +475,8 @@ class RailwayManager:
         except (ValueError, TypeError):
             snapshot["uptime_seconds"] = 0
         for ep in snapshot["endpoints"]:
-            first = self._first_seen.get(f"{ep['server']}:{ep['server_port']}")
+            host, port = primary_server(ep)
+            first = self._first_seen.get(f"{host}:{port}")
             ep["first_seen"] = first
             try:
                 seen = datetime.strptime(first or "", "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -540,7 +542,8 @@ class RailwayManager:
         endpoints = nodes_to_endpoints(nodes) if nodes else []
         with self._lock:
             self.status["endpoints"] = [
-                {"tag": ep["tag"], "server": ep["server"], "server_port": ep["server_port"],
+                {"tag": ep["tag"], "server": primary_server(ep)[0],
+                 "server_port": primary_server(ep)[1],
                  "country": n.get("country", ""), "country_short": n.get("country_short", ""),
                  "latency_ms": n.get("latency_ms"), "real_latency_ms": n.get("real_latency_ms"),
                  "speed": n.get("speed", 0)}
@@ -747,7 +750,8 @@ class RailwayManager:
             return self._refresh_failed("config check failed, kept previous")
         with self._lock:
             self.status["endpoints"] = [
-                {"tag": ep["tag"], "server": ep["server"], "server_port": ep["server_port"],
+                {"tag": ep["tag"], "server": primary_server(ep)[0],
+                 "server_port": primary_server(ep)[1],
                  "country": n.get("country", ""), "country_short": n.get("country_short", ""),
                  "latency_ms": n.get("latency_ms"), "real_latency_ms": n.get("real_latency_ms"),
                  "speed": n.get("speed", 0)}

@@ -27,6 +27,7 @@ _REMOTE_RE = re.compile(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(\S+))?\s*$", re.IGNOR
 _PROTO_RE = re.compile(r"^\s*proto\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 _AUTH_RE = re.compile(r"^\s*auth\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 _CIPHER_RE = re.compile(r"^\s*cipher\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+_REMOTE_RANDOM_RE = re.compile(r"^\s*remote-random\s*$", re.IGNORECASE | re.MULTILINE)
 _KEY_DIRECTION_RE = re.compile(r"^\s*key-direction\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
@@ -34,20 +35,35 @@ def _is_tcp_proto(proto: str) -> bool:
     return proto.lower().startswith("tcp")
 
 
-def _pick_tcp_remote(config_text: str) -> tuple[str, int]:
+def _all_tcp_remotes(config_text: str) -> list[tuple[str, int]]:
+    """Return every TCP remote in order (explicit proto first, then global)."""
     global_protos = [m.group(1) for m in _PROTO_RE.finditer(config_text)]
     global_tcp = any(_is_tcp_proto(p) for p in global_protos)
     remotes = [(m.group(1), int(m.group(2)), (m.group(3) or "")) for m in _REMOTE_RE.finditer(config_text)]
     if not remotes:
         raise ValueError("no remote directive found")
-    for host, port, proto in remotes:
-        if proto and _is_tcp_proto(proto):
-            return host, port
+    explicit = [(host, port) for host, port, proto in remotes
+                if proto and _is_tcp_proto(proto)]
+    if explicit:
+        return explicit
     if global_tcp:
-        for host, port, proto in remotes:
-            if not proto or not proto.lower().startswith("udp"):
-                return host, port
+        fallback = [(host, port) for host, port, proto in remotes
+                    if not proto or not proto.lower().startswith("udp")]
+        if fallback:
+            return fallback
     raise ValueError("no TCP remote found (only UDP available)")
+
+
+def _pick_tcp_remote(config_text: str) -> tuple[str, int]:
+    return _all_tcp_remotes(config_text)[0]
+
+
+def primary_server(endpoint: dict) -> tuple[str, int]:
+    """First reachable address of an endpoint (singular or servers[0])."""
+    if "server" in endpoint:
+        return endpoint["server"], endpoint["server_port"]
+    first = endpoint["servers"][0]
+    return first["server"], first["server_port"]
 
 
 def ovpn_to_endpoint(
@@ -59,7 +75,7 @@ def ovpn_to_endpoint(
     """Convert one OpenVPN client config (TCP) to a sing-box openvpn-client endpoint."""
     if not config_text or not config_text.strip():
         raise ValueError("empty openvpn config")
-    server, server_port = _pick_tcp_remote(config_text)
+    tcp_remotes = _all_tcp_remotes(config_text)
 
     blocks: dict[str, str] = {}
     for m in _BLOCK_RE.finditer(config_text):
@@ -100,8 +116,7 @@ def ovpn_to_endpoint(
     return {
         "type": "openvpn-client",
         "tag": tag,
-        "server": server,
-        "server_port": server_port,
+        **_server_fields(tcp_remotes),
         "network": "tcp",
         "username": username,
         "password": password,
@@ -109,9 +124,25 @@ def ovpn_to_endpoint(
         "data_ciphers": data_ciphers,
         "data_ciphers_fallback": data_ciphers[0],
         "auth": auth,
+        **({"remote_random": True} if _REMOTE_RANDOM_RE.search(config_text) else {}),
         "system": False,
         "redirect_gateway": True,
     }
+
+
+def _server_fields(tcp_remotes: list[tuple[str, int]]) -> dict:
+    """Singular server/server_port for one remote, servers[] otherwise.
+
+    sing-box requires exactly one of server / servers (they conflict),
+    so multi-remote configs move to servers[] for in-order failover.
+    """
+    if len(tcp_remotes) == 1:
+        host, port = tcp_remotes[0]
+        return {"server": host, "server_port": port}
+    return {"servers": [
+        {"server": host, "server_port": port, "network": "tcp"}
+        for host, port in tcp_remotes
+    ]}
 
 
 def probe_tcp_latency(host: str, port: int, timeout: int = 5) -> int:
@@ -406,7 +437,8 @@ def snapshot_to_nodes(
         lambda host, port: probe_tcp_latency(host, port, probe_timeout))
 
     def _node(speed, country, country_short, endpoint, latency_ms):
-        return {"server": endpoint["server"], "server_port": endpoint["server_port"],
+        host, port = primary_server(endpoint)
+        return {"server": host, "server_port": port,
                 "country": country, "country_short": country_short,
                 "speed": speed, "latency_ms": latency_ms, "real_latency_ms": None,
                 "endpoint": endpoint}
@@ -416,23 +448,33 @@ def snapshot_to_nodes(
         nodes = [_node(speed, country, short, ep, None)
                  for speed, country, short, ep in ranked]
     else:
-        pool = sorted(candidates, key=lambda item: item[0], reverse=True)[:probe_pool]
-        latencies: dict[int, int] = {}
-        with ThreadPoolExecutor(max_workers=probe_workers) as executor:
-            future_map = {executor.submit(check, ep["server"], ep["server_port"]): index
-                          for index, (_, _, _, ep) in enumerate(pool)}
-            for future in future_map:
-                try:
-                    latencies[future_map[future]] = future.result()
-                except Exception:
-                    latencies[future_map[future]] = 0
+        # Speed says nothing about reachability, so probe Speed-ranked
+        # chunks until one yields survivors instead of giving up after
+        # the first probe_pool rows.
+        ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
+        step = probe_pool if probe_pool else len(ranked) or 1
+        nodes = []
+        for start in range(0, len(ranked), step):
+            chunk = ranked[start:start + step]
+            latencies: dict[int, int] = {}
+            with ThreadPoolExecutor(max_workers=probe_workers) as executor:
+                future_map = {executor.submit(
+                    check, *primary_server(ep)): index
+                    for index, (_, _, _, ep) in enumerate(chunk)}
+                for future in future_map:
+                    try:
+                        latencies[future_map[future]] = future.result()
+                    except Exception:
+                        latencies[future_map[future]] = 0
 
-        alive = [(latencies[i], speed, country, short, ep)
-                 for i, (speed, country, short, ep) in enumerate(pool)
-                 if latencies.get(i, 0) > 0]
-        alive.sort(key=lambda item: item[0])
-        nodes = [_node(speed, country, short, ep, latency)
-                 for latency, speed, country, short, ep in alive]
+            alive = [(latencies[i], speed, country, short, ep)
+                     for i, (speed, country, short, ep) in enumerate(chunk)
+                     if latencies.get(i, 0) > 0]
+            alive.sort(key=lambda item: item[0])
+            nodes = [_node(speed, country, short, ep, latency)
+                     for latency, speed, country, short, ep in alive]
+            if nodes:
+                break
 
     if real_topk and real_topk > 0 and nodes:
         dial = dial_fn if dial_fn is not None else (
@@ -576,7 +618,8 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(build_singbox_config([endpoint], mixed_listen, mixed_port), indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"wrote {args.output} with 1 endpoint ({endpoint['server']}:{endpoint['server_port']})")
+    host, port = primary_server(endpoint)
+    print(f"wrote {args.output} with 1 endpoint ({host}:{port})")
     return 0
 
 

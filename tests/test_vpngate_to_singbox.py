@@ -607,5 +607,75 @@ Q1JZUFRfS0VZ
         )
 
 
+class MultiRemoteTests(unittest.TestCase):
+    MULTI_TCP_OVPN = TCP_OVPN.replace(
+        "remote 203.0.113.1 443 tcp",
+        "remote 203.0.113.1 443 tcp\nremote 203.0.113.2 1194 tcp",
+    )
+
+    def test_multiple_tcp_remotes_become_servers_list(self) -> None:
+        from vpngate_to_singbox import primary_server
+
+        ep = ovpn_to_endpoint(self.MULTI_TCP_OVPN, tag="vpngate-multi")
+
+        self.assertNotIn("server", ep)
+        self.assertNotIn("server_port", ep)
+        self.assertEqual(
+            [
+                {"server": "203.0.113.1", "server_port": 443, "network": "tcp"},
+                {"server": "203.0.113.2", "server_port": 1194, "network": "tcp"},
+            ],
+            ep["servers"],
+        )
+        self.assertEqual(("203.0.113.1", 443), primary_server(ep))
+
+    def test_single_remote_keeps_singular_server_fields(self) -> None:
+        from vpngate_to_singbox import primary_server
+
+        ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+
+        self.assertEqual("203.0.113.1", ep["server"])
+        self.assertEqual(443, ep["server_port"])
+        self.assertNotIn("servers", ep)
+        self.assertEqual(("203.0.113.1", 443), primary_server(ep))
+
+    def test_remote_random_directive_is_preserved(self) -> None:
+        ep = ovpn_to_endpoint(self.MULTI_TCP_OVPN + "remote-random\n", tag="vpngate-rr")
+
+        self.assertTrue(ep["remote_random"])
+
+
+class ProbeFallbackTests(unittest.TestCase):
+    def _csv(self) -> str:
+        rows = [
+            _snapshot_row_country("vpn-a", "203.0.113.11", 3000,
+                                  _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.11")),
+                                  "Japan", "JP"),
+            _snapshot_row_country("vpn-b", "203.0.113.12", 2000,
+                                  _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.12")),
+                                  "Japan", "JP"),
+            _snapshot_row_country("vpn-c", "203.0.113.13", 1000,
+                                  _b64(TCP_OVPN.replace("203.0.113.1", "203.0.113.13")),
+                                  "Japan", "JP"),
+        ]
+        return "\n".join([CSV_HEADER] + rows) + "\n"
+
+    def test_probe_falls_through_to_next_speed_chunk(self) -> None:
+        latencies = {"203.0.113.11": 0, "203.0.113.12": 0, "203.0.113.13": 50}
+
+        nodes = snapshot_to_nodes(
+            self._csv(), probe_pool=2,
+            probe_fn=lambda host, port: latencies[host])
+
+        self.assertEqual(["203.0.113.13"], [n["server"] for n in nodes])
+        self.assertEqual(50, nodes[0]["latency_ms"])
+
+    def test_probe_all_dead_still_returns_empty(self) -> None:
+        nodes = snapshot_to_nodes(
+            self._csv(), probe_pool=2, probe_fn=lambda host, port: 0)
+
+        self.assertEqual([], nodes)
+
+
 if __name__ == "__main__":
     unittest.main()
