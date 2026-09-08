@@ -1670,5 +1670,129 @@ class PipeIdleTests(unittest.TestCase):
                     pass
 
 
+class RefreshMutexTests(unittest.TestCase):
+    """P1: concurrent refresh_once calls must not interleave; second skips."""
+    def test_concurrent_refresh_skips_second(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def _blocking_fetch(url, timeout):
+            calls.append("fetch")
+            started.set()
+            release.wait(timeout=30)
+            raise RuntimeError("fetch failed")
+
+        manager = RailwayManager(
+            port=0, mixed_port=get_free_port(), start_singbox=False,
+            auto_refresh=False, fetch_on_start=False,
+            admin_token="test-admin-token-0123456789abcdef",
+            config_path=f"/tmp/railway-mtx-{id(self)}.json",
+            nodes_path=f"/tmp/railway-mtx-{id(self)}-nodes.json",
+            state_path=f"/tmp/railway-mtx-{id(self)}-state.json")
+        manager.retry_delays = ()
+        try:
+            worker = threading.Thread(
+                target=manager.refresh_once,
+                kwargs={"fetcher": _blocking_fetch}, daemon=True)
+            worker.start()
+            self.assertTrue(started.wait(timeout=10))
+
+            def _must_not_run(url, timeout):
+                calls.append("second-fetch")
+                raise AssertionError("second refresh fetched concurrently")
+
+            ok = manager.refresh_once(fetcher=_must_not_run)
+            release.set()
+            worker.join(timeout=30)
+        finally:
+            release.set()
+            manager.stop()
+
+        self.assertFalse(ok)
+        self.assertNotIn("second-fetch", calls)
+        events = [h["event"] for h in manager.status["refresh_history"]]
+        self.assertIn("refresh-busy", events)
+
+
+class LoopSurvivalTests(unittest.TestCase):
+    """P1: background loops must survive one worker error, not die silent."""
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def _manager(self, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
+                        auto_refresh=False, fetch_on_start=False,
+                        admin_token=self.TOKEN,
+                        config_path=f"/tmp/railway-loop-{id(self)}.json",
+                        nodes_path=f"/tmp/railway-loop-{id(self)}-nodes.json",
+                        state_path=f"/tmp/railway-loop-{id(self)}-state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def test_refresh_loop_survives_worker_error(self) -> None:
+        manager = self._manager()
+        manager.refresh_seconds = 0
+        calls = []
+
+        # NOTE: side_effect must be a FUNCTION here: members of a
+        # side_effect *list* that are functions get returned, not called,
+        # so the stop event would never be set and the loop spins forever.
+        def _flaky():
+            calls.append("refresh")
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            manager._stop_event.set()
+            return True
+
+        try:
+            with mock.patch.object(manager, "refresh_once",
+                                   side_effect=_flaky), \
+                 mock.patch("railway_manager.random.uniform",
+                            return_value=-30):
+                manager._refresh_loop()
+        finally:
+            manager.stop()
+
+        self.assertEqual(["refresh", "refresh"], calls)
+
+    def test_supervise_loop_survives_worker_error(self) -> None:
+        manager = self._manager()
+        manager.want_singbox = True
+        open(manager.config_path, "w").close()
+
+        class DeadProc:
+            def poll(self):
+                return 1
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        manager._singbox_proc = DeadProc()
+        calls = []
+
+        def _flaky_restart():
+            calls.append("restart")
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            manager._stop_event.set()
+
+        try:
+            with mock.patch.object(manager, "_restart_singbox",
+                                   side_effect=_flaky_restart), \
+                 mock.patch("railway_manager.SUPERVISE_INTERVAL", 0), \
+                 mock.patch("railway_manager.CRASH_BACKOFFS", (0,)):
+                manager._supervise_loop()
+        finally:
+            manager.stop()
+
+        self.assertEqual(["restart", "restart"], calls)
+
+
 if __name__ == "__main__":
     unittest.main()

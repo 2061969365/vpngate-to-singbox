@@ -625,6 +625,7 @@ class RailwayManager:
         self._crash_streak = 0
         self._retry_after = 0.0
         self._lock = threading.RLock()
+        self._refresh_lock = threading.Lock()
         self.status: dict = {
             "endpoints": [],
             "countries": [],
@@ -1041,42 +1042,51 @@ class RailwayManager:
     def _refresh_loop(self) -> None:
         next_run = time.monotonic() + self._effective_interval() + random.uniform(-30, 30)
         while not self._stop_event.wait(max(0.0, next_run - time.monotonic())):
-            self.refresh_once()
+            try:
+                self.refresh_once()
+            except Exception as exc:  # never kill the refresh thread
+                print(f"refresh loop error: {type(exc).__name__}: {exc}", flush=True)
             next_run = (time.monotonic() + self._effective_interval()
                         + random.uniform(-30, 30))
 
     def _supervise_loop(self) -> None:
         while not self._stop_event.wait(SUPERVISE_INTERVAL):
-            with self._lock:
-                if not self.want_singbox:
-                    continue
-                proc = self._singbox_proc
-                if proc is not None and proc.poll() is None:
-                    self._crash_streak = 0
-                    continue
-                if proc is None and not os.path.exists(self.config_path):
-                    continue
-                now = time.monotonic()
-                if self._crash_streak >= MAX_CRASH_STREAK:
-                    continue  # wait for next successful refresh to reset
-                if now < self._retry_after:
-                    continue
-                delay = CRASH_BACKOFFS[min(self._crash_streak, len(CRASH_BACKOFFS) - 1)]
-                self._retry_after = now + delay
-                self._crash_streak += 1
-                exit_info = f" (previous exit code {proc.poll()})" if proc else ""
-                self.status["last_error"] = f"sing-box not running{exit_info}, restart in {delay}s"
-                restart_now = now >= self._retry_after - delay
-            if restart_now:
-                self._restart_singbox()
-            # Relaunch the tunnel if it was wanted but died; _start_cloudflared
-            # soft-skips again when there is no token/binary.
-            with self._lock:
-                cf = self._cloudflared_proc
-                want_cf = bool(self.tunnel_token)
-                cf_alive = cf is not None and cf.poll() is None
-            if want_cf and not cf_alive:
-                self._start_cloudflared()
+            try:
+                self._supervise_once()
+            except Exception as exc:  # never kill the supervise thread
+                print(f"supervise loop error: {type(exc).__name__}: {exc}", flush=True)
+
+    def _supervise_once(self) -> None:
+        with self._lock:
+            if not self.want_singbox:
+                return
+            proc = self._singbox_proc
+            if proc is not None and proc.poll() is None:
+                self._crash_streak = 0
+                return
+            if proc is None and not os.path.exists(self.config_path):
+                return
+            now = time.monotonic()
+            if self._crash_streak >= MAX_CRASH_STREAK:
+                return  # wait for next successful refresh to reset
+            if now < self._retry_after:
+                return
+            delay = CRASH_BACKOFFS[min(self._crash_streak, len(CRASH_BACKOFFS) - 1)]
+            self._retry_after = now + delay
+            self._crash_streak += 1
+            exit_info = f" (previous exit code {proc.poll()})" if proc else ""
+            self.status["last_error"] = f"sing-box not running{exit_info}, restart in {delay}s"
+            restart_now = now >= self._retry_after - delay
+        if restart_now:
+            self._restart_singbox()
+        # Relaunch the tunnel if it was wanted but died; _start_cloudflared
+        # soft-skips again when there is no token/binary.
+        with self._lock:
+            cf = self._cloudflared_proc
+            want_cf = bool(self.tunnel_token)
+            cf_alive = cf is not None and cf.poll() is None
+        if want_cf and not cf_alive:
+            self._start_cloudflared()
 
     def _health_monitor_loop(self) -> None:
         while not self._stop_event.wait(HEALTH_CHECK_INTERVAL):
@@ -1205,6 +1215,19 @@ class RailwayManager:
         return True
 
     def refresh_once(self, fetcher=None, probe_pool: int = 0) -> bool:
+        # Manual (/api/refresh), scheduled (_refresh_loop) and boot
+        # (_initial_refresh) refreshes must never interleave: two of them
+        # writing tmp-*/nodes/state at once corrupts the config.
+        if not self._refresh_lock.acquire(blocking=False):
+            self._record_history("refresh-busy",
+                                 "skipped: another refresh in progress")
+            return False
+        try:
+            return self._refresh_once_inner(fetcher, probe_pool)
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_once_inner(self, fetcher=None, probe_pool: int = 0) -> bool:
         try:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)

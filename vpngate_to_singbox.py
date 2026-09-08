@@ -11,6 +11,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -21,6 +22,11 @@ DEFAULT_PASSWORD = "vpn"
 # so the old ciphers must be listed explicitly.
 DEFAULT_DATA_CIPHERS = ["AES-128-CBC", "AES-256-CBC", "BF-CBC"]
 DEFAULT_AUTH = "SHA1"
+# Cap concurrent throwaway sing-box dials: refresh (dial_workers) +
+# full_probe + single_probe + verify can otherwise stack ~13 processes
+# on a 1GB box. Excess dialers queue on the gate instead of OOMing.
+MAX_CONCURRENT_DIALS = 10
+_DIAL_GATE = threading.BoundedSemaphore(MAX_CONCURRENT_DIALS)
 
 _BLOCK_RE = re.compile(r"<(ca|cert|key|tls-auth|tls-crypt)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
 _REMOTE_RE = re.compile(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(\S+))?\s*$", re.IGNORECASE | re.MULTILINE)
@@ -91,6 +97,10 @@ def ovpn_to_endpoint(
         cipher = cipher_m.group(1)
         data_ciphers = [cipher] + [c for c in data_ciphers if c.lower() != cipher.lower()]
 
+    if blocks.get("cert") and not blocks.get("key"):
+        raise ValueError("client <cert> without <key> (must be both or neither)")
+    if blocks.get("key") and not blocks.get("cert"):
+        raise ValueError("client <key> without <cert> (must be both or neither)")
     tls: dict = {
         "certificate": blocks["ca"],
         "certificate_profile": "legacy",
@@ -101,16 +111,21 @@ def ovpn_to_endpoint(
         tls["client_key"] = blocks["key"]
     # sing-box control_wrap replaces OpenVPN tls-auth/tls-crypt inline keys.
     # Dropping them silently breaks the handshake, so map them explicitly.
+    # direction is a "server"/"client" STRING (OpenVPN key-direction 0/1)
+    # and only exists for tls_auth; tls_crypt never carries one.
     if blocks.get("tls-crypt"):
         control_wrap: dict = {"type": "tls_crypt", "key": blocks["tls-crypt"]}
     elif blocks.get("tls-auth"):
         control_wrap = {"type": "tls_auth", "key": blocks["tls-auth"]}
+        direction_m = _KEY_DIRECTION_RE.search(config_text)
+        if direction_m:
+            direction = {"0": "server", "1": "client"}.get(
+                direction_m.group(1))
+            if direction is not None:
+                control_wrap["direction"] = direction
     else:
         control_wrap = {}
     if control_wrap:
-        direction_m = _KEY_DIRECTION_RE.search(config_text)
-        if direction_m:
-            control_wrap["direction"] = int(direction_m.group(1))
         tls["control_wrap"] = control_wrap
 
     return {
@@ -386,6 +401,7 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
     port = _free_port()
     config = _dial_probe_config(endpoint, port)
     tmpdir = tempfile.TemporaryDirectory()
+    _DIAL_GATE.acquire()
     try:
         cfg_path = str(Path(tmpdir.name) / "dial.json")
         Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
@@ -450,6 +466,7 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                 except OSError:
                     pass
     finally:
+        _DIAL_GATE.release()
         tmpdir.cleanup()
 
 
@@ -464,6 +481,7 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
     port = _free_port()
     config = _dial_probe_config(endpoint, port)
     tmpdir = tempfile.TemporaryDirectory()
+    _DIAL_GATE.acquire()
     try:
         cfg_path = str(Path(tmpdir.name) / "dial.json")
         Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
@@ -525,6 +543,7 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                 except OSError:
                     pass
     finally:
+        _DIAL_GATE.release()
         tmpdir.cleanup()
 
 
@@ -596,6 +615,10 @@ def snapshot_to_nodes(
     exceptions keep the node as unmeasured instead of dropping it.
     Returns [] when nothing is reachable (caller decides failure).
     """
+    if probe_pool is not None and probe_pool < 0:
+        raise ValueError(f"probe_pool must be >= 0, got {probe_pool}")
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit}")
     candidates = list(_iter_tcp_candidates(csv_text, username, password))
     check = probe_fn if probe_fn is not None else (
         lambda host, port: probe_tcp_latency(host, port, probe_timeout))
@@ -633,7 +656,7 @@ def snapshot_to_nodes(
 
             alive = [(latencies[i], speed, country, short, ep)
                      for i, (speed, country, short, ep) in enumerate(chunk)
-                     if latencies.get(i, 0) > 0]
+                     if (latencies.get(i) or 0) > 0]
             alive.sort(key=lambda item: item[0])
             nodes = [_node(speed, country, short, ep, latency)
                      for latency, speed, country, short, ep in alive]

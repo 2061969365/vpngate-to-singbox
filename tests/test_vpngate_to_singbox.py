@@ -5,6 +5,7 @@ import ssl
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vpngate_to_singbox import (
     build_singbox_config,
@@ -183,6 +184,21 @@ class SnapshotToNodesTests(unittest.TestCase):
         self.assertEqual(2, len(nodes))
         self.assertEqual("203.0.113.11", nodes[0]["server"])
         self.assertIsNone(nodes[0]["latency_ms"])
+
+    def test_probe_fn_none_treated_as_dead(self) -> None:
+        nodes = snapshot_to_nodes(self._csv(), probe_fn=lambda host, port: None)
+
+        self.assertEqual([], nodes)
+
+    def test_negative_probe_pool_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            snapshot_to_nodes(self._csv(), probe_pool=-5,
+                              probe_fn=lambda host, port: 100)
+
+    def test_negative_limit_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            snapshot_to_nodes(self._csv(), limit=-1,
+                              probe_fn=lambda host, port: 100)
 
 
 class NodesToEndpointsTests(unittest.TestCase):
@@ -603,7 +619,25 @@ Q1JZUFRfS0VZ
         ep = ovpn_to_endpoint(self.TLS_AUTH_OVPN, tag="vpngate-ta")
 
         self.assertEqual(
-            {"type": "tls_auth", "key": "VE9LRU4=", "direction": 1},
+            {"type": "tls_auth", "key": "VE9LRU4=", "direction": "client"},
+            ep["tls"]["control_wrap"],
+        )
+
+    def test_tls_auth_direction_zero_maps_to_server(self) -> None:
+        ovpn = self.TLS_AUTH_OVPN.replace("key-direction 1", "key-direction 0")
+        ep = ovpn_to_endpoint(ovpn, tag="vpngate-ta0")
+
+        self.assertEqual(
+            {"type": "tls_auth", "key": "VE9LRU4=", "direction": "server"},
+            ep["tls"]["control_wrap"],
+        )
+
+    def test_tls_auth_without_key_direction_omits_it(self) -> None:
+        ovpn = self.TLS_AUTH_OVPN.replace("key-direction 1\n", "")
+        ep = ovpn_to_endpoint(ovpn, tag="vpngate-tanodir")
+
+        self.assertEqual(
+            {"type": "tls_auth", "key": "VE9LRU4="},
             ep["tls"]["control_wrap"],
         )
 
@@ -614,6 +648,29 @@ Q1JZUFRfS0VZ
             {"type": "tls_crypt", "key": "Q1JZUFRfS0VZ"},
             ep["tls"]["control_wrap"],
         )
+
+    def test_tls_crypt_ignores_key_direction(self) -> None:
+        ovpn = self.TLS_CRYPT_OVPN + "key-direction 1\n"
+        ep = ovpn_to_endpoint(ovpn, tag="vpngate-tcdir")
+
+        self.assertEqual(
+            {"type": "tls_crypt", "key": "Q1JZUFRfS0VZ"},
+            ep["tls"]["control_wrap"],
+        )
+
+    def test_cert_without_key_raises(self) -> None:
+        import re
+
+        ovpn = re.sub(r"<key>.*?</key>\n?", "", TCP_OVPN, flags=re.S)
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(ovpn, tag="vpngate-halfcert")
+
+    def test_key_without_cert_raises(self) -> None:
+        import re
+
+        ovpn = re.sub(r"<cert>.*?</cert>\n?", "", TCP_OVPN, flags=re.S)
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(ovpn, tag="vpngate-halfkey")
 
 
 class MultiRemoteTests(unittest.TestCase):
@@ -741,6 +798,27 @@ class VlessDualInboundTests(unittest.TestCase):
         endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
         with self.assertRaises(ValueError):
             build_singbox_config([endpoint], vless_uuid=UUID)
+
+
+class DialGateTests(unittest.TestCase):
+    """P1: concurrent throwaway dials are capped so a 1GB box survives."""
+
+    def test_gate_cap_is_ten(self) -> None:
+        from vpngate_to_singbox import MAX_CONCURRENT_DIALS, _DIAL_GATE
+
+        self.assertEqual(10, MAX_CONCURRENT_DIALS)
+        self.assertIsInstance(_DIAL_GATE, threading.BoundedSemaphore)
+
+    def test_measure_acquires_and_releases_gate(self) -> None:
+        import vpngate_to_singbox as mod
+
+        ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-gate")
+        with mock.patch.object(mod, "_DIAL_GATE") as gate, \
+             mock.patch("subprocess.Popen", side_effect=OSError("noexec")):
+            self.assertIsNone(mod.measure_real_latency(ep, timeout=5))
+            self.assertEqual((None, None), mod.measure_exit_ip(ep, timeout=5))
+        self.assertTrue(gate.acquire.called)
+        self.assertTrue(gate.release.called)
 
 
 if __name__ == "__main__":
