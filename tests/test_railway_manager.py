@@ -11,7 +11,8 @@ import time
 import unittest
 from unittest import mock
 
-from railway_manager import RailwayManager, build_config_from_env, classify_first_bytes, default_fetch
+from railway_manager import (UI_HTML, RailwayManager, build_config_from_env,
+                               classify_first_bytes, default_fetch)
 from vpngate_to_singbox import (build_singbox_config, nodes_to_endpoints,
                                 ovpn_to_endpoint, snapshot_to_nodes)
 
@@ -308,6 +309,30 @@ class AuthTests(unittest.TestCase):
 
         self.assertIn(b"200 OK", response)
         self.assertIn(b"Authorization", response)
+
+
+class AstraUiTests(unittest.TestCase):
+    """Astra-style /ui: hero kicker, pills, bench table, verify CTA."""
+
+    def test_hero_kicker_and_verify_cta_present(self) -> None:
+        self.assertIn('id="hero-kicker"', UI_HTML)
+        self.assertIn('id="btn-verify"', UI_HTML)
+        self.assertIn('id="btn-refresh"', UI_HTML)
+
+    def test_pills_and_bench_table_present(self) -> None:
+        self.assertIn('id="pills"', UI_HTML)
+        self.assertIn('id="bench-body"', UI_HTML)
+        self.assertIn('id="history-line"', UI_HTML)
+
+    def test_api_contract_preserved(self) -> None:
+        self.assertIn("/api/status", UI_HTML)
+        self.assertIn("/api/switch", UI_HTML)
+        self.assertIn("/api/refresh", UI_HTML)
+        self.assertIn("Authorization", UI_HTML)
+
+    def test_dark_theme_and_nav_present(self) -> None:
+        self.assertIn('id="topnav"', UI_HTML)
+        self.assertIn("background:#000", UI_HTML)
 
 
 class EnvValidationTests(unittest.TestCase):

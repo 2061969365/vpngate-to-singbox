@@ -54,22 +54,55 @@ UI_HTML = """\
 <!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>vpngate-to-singbox</title></head>
-<body style="font-family:sans-serif;max-width:720px;margin:2em auto">
-<h1>vpngate-to-singbox</h1>
-<p>SOCKS5/HTTP proxy (same port) -&gt; VPNGate over sing-box, no TUN.</p>
-<div>
-<label>Token: <input id="token" type="password" size="24"></label>
-<button onclick="saveToken()">Save</button>
-<label>Country: <select id="country"><option value="">auto</option></select></label>
-<button onclick="switchCountry()">Switch</button>
-<button onclick="refreshNow()">Refresh nodes</button>
+<title>vpngate console</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+#topnav{display:flex;align-items:center;gap:26px;padding:16px 32px;font-size:14px}
+#topnav .logo{font-weight:700;font-size:16px}
+#topnav .links{display:flex;gap:22px;color:#ccc}
+#topnav .right{margin-left:auto;display:flex;gap:14px;align-items:center}
+#topnav input{background:#111;border:1px solid #444;color:#fff;border-radius:6px;padding:6px 10px;font-size:13px}
+#topnav .cta{border:1px solid #555;border-radius:999px;padding:7px 18px;cursor:pointer}
+.hero{padding:70px 32px 56px;background:radial-gradient(ellipse 60% 50% at 70% 40%,rgba(64,120,255,.22),transparent 70%),radial-gradient(ellipse 40% 40% at 30% 70%,rgba(0,200,150,.12),transparent 70%),#000}
+#hero-kicker{font-size:56px;font-weight:700;letter-spacing:-.03em;line-height:1.05}
+#hero-sub{color:#b5b5b5;font-size:15px;line-height:1.65;max-width:760px;margin-top:14px}
+#pills{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+#pills span{border:1px solid #444;border-radius:999px;padding:7px 18px;font-size:13px;color:#ddd;cursor:pointer}
+#pills span.on{background:#fff;color:#000;border-color:#fff}
+.actions{display:flex;gap:12px;margin-top:20px}
+#btn-verify{background:#fff;color:#000;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none}
+#btn-refresh{border:1px solid #555;border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:transparent;cursor:pointer}
+.section{padding:44px 32px;border-top:1px solid #1c1c1c;max-width:1200px}
+.section h2{font-size:26px;font-weight:600;margin-bottom:12px}
+.section p{color:#b5b5b5;font-size:14px;line-height:1.7;max-width:800px;margin-bottom:16px}
+table.bench{width:100%;border-collapse:collapse;font-size:14px}
+table.bench th,table.bench td{text-align:left;padding:10px 14px;border-bottom:1px solid #222}
+table.bench th{color:#888;font-weight:500}
+table.bench td.hl{color:#fff;font-weight:600}
+table.bench td.op a{color:#8ab4ff;cursor:pointer;text-decoration:none}
+#history-line{color:#888;font-size:13px;margin-top:16px}
+.footer{border-top:1px solid #1c1c1c;padding:28px 32px;display:flex;gap:48px;color:#888;font-size:13px}
+.footer b{color:#ccc;display:block;margin-bottom:8px}
+@media(max-width:768px){#hero-kicker{font-size:36px}.hero,.section{padding-left:18px;padding-right:18px}#topnav .links{display:none}}
+</style></head>
+<body>
+<div id="topnav"><span class="logo">vpngate</span><span class="links"><span>总览</span><span>节点</span><span>历史</span></span><span class="right"><input id="token" type="password" size="18" placeholder="ADMIN_TOKEN"><span class="cta" onclick="saveToken()">Save</span></span></div>
+<div class="hero">
+<div id="hero-kicker">—<br>—</div>
+<p id="hero-sub">loading…</p>
+<div id="pills"></div>
+<div class="actions"><button id="btn-verify" onclick="verifyNow()">验证出口 IP</button><button id="btn-refresh" onclick="refreshNow()">刷新节点</button></div>
 </div>
-<table border="1" cellpadding="6" id="nodes">
-<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th><th>real</th></tr>
-</table>
-<p id="meta"></p>
+<div class="section">
+<h2>可用节点</h2>
+<p>按隧道延迟排序。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。</p>
+<table class="bench"><thead><tr><th>Endpoint</th><th>国家</th><th>握手</th><th>实测</th><th>存活</th><th>操作</th></tr></thead><tbody id="bench-body"></tbody></table>
+<p id="history-line"></p>
+</div>
+<div class="footer"><div><b>控制台</b><div>总览 · 节点 · 历史</div></div><div><b>状态</b><div id="foot-status">—</div></div><div><b>说明</b><div>自用调试 · sing-box 内部协议栈 · 无 TUN</div></div></div>
 <script>
+var activeCountry = "";
 function authHeaders() {
   return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
 }
@@ -83,31 +116,46 @@ async function api(path, method, body) {
   if (r.status === 401) throw new Error("unauthorized: save ADMIN_TOKEN first");
   return r.json();
 }
+function fmtMs(v) { return v == null ? "—" : v + "ms"; }
 async function refresh() {
   try {
     const s = await api("/api/status");
-    const sel = document.getElementById("country");
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">auto</option>' +
-      s.countries.map(c => `<option value="${c.code}">${c.name} (${c.code})</option>`).join("");
-    sel.value = cur;
-    document.getElementById("nodes").innerHTML =
-      "<tr><th>endpoint</th><th>country</th><th>server</th><th>port</th><th>latency</th><th>real</th></tr>" +
-      s.endpoints.map(e => `<tr><td>${e.tag}${e.tag === s.preferred_tag ? " *pinned" : ""}</td><td>${e.country_short}</td><td>${e.server}</td><td>${e.server_port}</td><td>${e.latency_ms}ms</td><td>${e.real_latency_ms == null ? "-" : e.real_latency_ms + "ms"}</td></tr>`).join("");
-    document.getElementById("meta").textContent =
-      `pinned: ${s.preferred_tag} | refresh ok/fail: ${s.refresh_ok}/${s.refresh_fail} | uptime: ${s.uptime_seconds}s | error: ${s.last_error}`;
+    const eps = s.endpoints.filter(e => !activeCountry || e.country_short === activeCountry);
+    const pref = s.endpoints.find(e => e.tag === s.preferred_tag) || eps[0];
+    document.getElementById("hero-kicker").innerHTML =
+      (pref ? pref.country_short + "<br>" + fmtMs(pref.real_latency_ms != null ? pref.real_latency_ms : pref.latency_ms) : "—<br>无节点");
+    document.getElementById("hero-sub").textContent =
+      pref ? ("经 " + pref.tag + " 出站 · " + pref.server + ":" + pref.server_port + " · 存活 " + (pref.alive_seconds || 0) + "s") : "暂无可用节点";
+    document.getElementById("pills").innerHTML =
+      '<span data-c="" class="' + (activeCountry === "" ? "on" : "") + '">全部 ' + s.endpoints.length + "</span>" +
+      s.countries.map(c => '<span data-c="' + c.code + '" class="' + (activeCountry === c.code ? "on" : "") + '">' + c.name + "</span>").join("");
+    document.querySelectorAll("#pills span").forEach(el => el.onclick = () => { activeCountry = el.getAttribute("data-c"); refresh(); });
+    document.getElementById("bench-body").innerHTML = eps.map(e =>
+      "<tr><td class='hl'>" + e.tag + (e.tag === s.preferred_tag ? " *pinned" : "") + "</td><td>" + e.country_short + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
+      "</td><td class='hl'>" + fmtMs(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
+      "<td class='op'><a onclick='probeOne(" + e.tag + ")'>测速</a> <a onclick='switchTag(" + e.tag + ")'>切换</a></td></tr>").join("");
+    document.getElementById("history-line").textContent =
+      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error;
+    document.getElementById("foot-status").textContent = "uptime " + s.uptime_seconds + "s · refresh " + s.refresh_ok + "/" + s.refresh_fail;
   } catch (e) {
-    document.getElementById("meta").textContent = "status fetch failed: " + e;
+    document.getElementById("hero-sub").textContent = "status fetch failed: " + e;
   }
 }
-async function switchCountry() {
-  const country = document.getElementById("country").value;
-  await api("/api/switch", "POST", country ? {"country": country} : {"tag": "auto"});
+async function switchTag(tag) {
+  await api("/api/switch", "POST", {"tag": tag});
+  refresh();
+}
+async function probeOne(tag) {
+  await api("/api/switch", "POST", {"tag": tag});
   refresh();
 }
 async function refreshNow() {
   await api("/api/refresh", "POST", {});
   refresh();
+}
+async function verifyNow() {
+  await refresh();
+  document.getElementById("hero-sub").textContent += " · 已重新验证";
 }
 document.getElementById("token").value = localStorage.getItem("admin_token") || "";
 refresh();
