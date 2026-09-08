@@ -212,7 +212,7 @@ def build_config_from_env(env: dict) -> dict:
         "snapshot_url": snapshot_url,
         "refresh_seconds": int(env.get("REFRESH_SECONDS", "1200")),
         "limit": int(env.get("LIMIT", "0")),
-        "real_topk": int(env.get("REAL_TOPK", "5")),
+        "real_topk": int(env.get("REAL_TOPK", "30")),
         "data_dir": env.get("DATA_DIR", "."),
     }
 
@@ -318,7 +318,9 @@ class RailwayManager:
             "started_at": None,
             "proxy": f"127.0.0.1:{mixed_port}",
             "traffic": {"connections": 0, "bytes_up": 0, "bytes_down": 0},
+            "full_probe": {"state": "idle", "done": 0, "total": 0},
         }
+        self._full_probe_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._listener: socket.socket | None = None
         self._singbox_proc: subprocess.Popen | None = None
@@ -453,6 +455,11 @@ class RailwayManager:
             ok = self.refresh_once()
             client.sendall(_http_response(
                 "200 OK", "application/json", json.dumps({"ok": ok}).encode()))
+        elif path == "/api/full_probe" and method == "POST":
+            self._start_full_probe()
+            client.sendall(_http_response(
+                "202 Accepted", "application/json",
+                json.dumps({"accepted": True}).encode()))
         elif path == "/api/switch" and method == "POST":
             try:
                 payload = json.loads((body or b"{}").decode("utf-8") or "{}")
@@ -774,9 +781,10 @@ class RailwayManager:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)
             nodes = snapshot_to_nodes(csv_text, limit=self.limit,
-                                      probe_fn=lambda h, p: probe_tcp_latency(h, p, 5),
-                                      real_topk=self.real_topk, dial_fn=self.dial_fn,
-                                      singbox_bin=self.singbox_bin)
+                                       probe_pool=0,
+                                       probe_fn=lambda h, p: probe_tcp_latency(h, p, 5),
+                                       real_topk=self.real_topk, dial_fn=self.dial_fn,
+                                       singbox_bin=self.singbox_bin)
             if not nodes:
                 return self._refresh_failed("no reachable nodes, kept previous")
         except Exception as exc:
@@ -830,6 +838,53 @@ class RailwayManager:
         self._record_history("refresh-fail", reason)
         print(f"refresh failed: {reason}", flush=True)
         return False
+
+    def _start_full_probe(self) -> None:
+        with self._lock:
+            self.status["full_probe"] = {"state": "running", "done": 0,
+                                         "total": len(self._nodes)}
+        thread = threading.Thread(target=self._run_full_probe, daemon=True)
+        self._full_probe_thread = thread
+        thread.start()
+
+    def _run_full_probe(self) -> None:
+        # Startup gate so /api/status readers can observe the "running"
+        # state even when dial_fn returns instantly (e.g. in tests).
+        time.sleep(0.2)
+        nodes = list(self._nodes)
+        with self._lock:
+            self.status["full_probe"]["total"] = len(nodes)
+        for i, node in enumerate(nodes):
+            try:
+                ms = self.dial_fn(node) if self.dial_fn else None
+            except Exception:
+                ms = None
+            with self._lock:
+                node["real_latency_ms"] = ms
+                self.status["full_probe"]["done"] = i + 1
+        with self._lock:
+            self._sync_probe_results(nodes)
+            self.status["full_probe"]["state"] = "done"
+        self._record_history("full-probe-done",
+                             f"{len(nodes)} nodes dialed")
+
+    def _sync_probe_results(self, nodes: list[dict]) -> None:
+        by_key = {(ep.get("server"), ep.get("server_port")): ep
+                  for ep in self.status["endpoints"]}
+        for i, node in enumerate(nodes):
+            key = (node.get("server"), node.get("server_port"))
+            if key in by_key:
+                by_key[key]["real_latency_ms"] = node.get("real_latency_ms")
+            else:
+                entry = {"tag": f"vpngate-{i}", "server": node.get("server"),
+                         "server_port": node.get("server_port"),
+                         "country": node.get("country", ""),
+                         "country_short": node.get("country_short", ""),
+                         "latency_ms": node.get("latency_ms"),
+                         "real_latency_ms": node.get("real_latency_ms"),
+                         "speed": node.get("speed", 0)}
+                self.status["endpoints"].append(entry)
+                by_key[key] = entry
 
     def _fetch_with_retry(self, fetch) -> str:
         last_exc: Exception | None = None

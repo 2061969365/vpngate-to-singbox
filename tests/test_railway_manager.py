@@ -255,6 +255,99 @@ class RefreshTests(unittest.TestCase):
         self.assertNotIn("198.51.100.99:443", manager._first_seen)
         self.assertIn("203.0.113.12:443", manager._first_seen)
 
+    def test_refresh_full_scans_every_candidate(self) -> None:
+        manager = self._manager()
+        try:
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            return_value=[]) as snapshot_mock:
+                manager.refresh_once(
+                    fetcher=lambda url, timeout: _snapshot_csv("203.0.113.11"))
+        finally:
+            manager.stop()
+
+        _, kwargs = snapshot_mock.call_args
+        self.assertEqual(0, kwargs.get("probe_pool"))
+
+
+class FullProbeTests(unittest.TestCase):
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def _manager(self, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
+                        auto_refresh=False, fetch_on_start=False,
+                        admin_token=self.TOKEN,
+                        config_path=f"/tmp/railway-probe-{id(self)}.json",
+                        nodes_path=f"/tmp/railway-probe-{id(self)}-nodes.json",
+                        state_path=f"/tmp/railway-probe-{id(self)}-state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def _post(self, manager, path, token=True):
+        class FakeClient:
+            def __init__(self):
+                self.sent = b""
+
+            def recv(self, size):
+                return b""
+
+            def sendall(self, data):
+                self.sent += data
+
+        headers = (f"POST {path} HTTP/1.1\r\nContent-Length: 0\r\n"
+                   + (f"Authorization: Bearer {self.TOKEN}\r\n" if token else ""))
+        client = FakeClient()
+        manager._handle_http(client, (headers + "\r\n").encode("latin-1"))
+        head, _, body = client.sent.partition(b"\r\n\r\n")
+        return head.decode("latin-1").split("\r\n")[0], body
+
+    def _seed_nodes(self, manager, *ips):
+        manager._nodes = [{"server": ip, "server_port": 443,
+                           "country": "Japan", "country_short": "JP",
+                           "latency_ms": 100, "real_latency_ms": None,
+                           "speed": 1000} for ip in ips]
+
+    def test_full_probe_rejects_missing_token(self) -> None:
+        manager = self._manager()
+        try:
+            status_line, _ = self._post(manager, "/api/full_probe", token=False)
+        finally:
+            manager.stop()
+
+        self.assertIn("401", status_line)
+
+    def test_full_probe_accepts_and_runs_in_background(self) -> None:
+        manager = self._manager(dial_fn=lambda node: 50)
+        try:
+            self._seed_nodes(manager, "203.0.113.11", "203.0.113.12")
+            status_line, body = self._post(manager, "/api/full_probe", token=True)
+            accepted_state = manager.status["full_probe"]["state"]
+            manager._full_probe_thread.join(timeout=30)
+            final_state = manager.status["full_probe"]["state"]
+        finally:
+            manager.stop()
+
+        self.assertIn("202", status_line)
+        self.assertTrue(json.loads(body.decode())["accepted"])
+        self.assertEqual("running", accepted_state)
+        self.assertEqual("done", final_state)
+        self.assertEqual(2, manager.status["full_probe"]["done"])
+        self.assertEqual(2, manager.status["full_probe"]["total"])
+
+    def test_full_probe_fills_real_latency_for_every_node(self) -> None:
+        manager = self._manager(dial_fn=lambda node: 77)
+        try:
+            self._seed_nodes(manager, "203.0.113.11", "203.0.113.12")
+            self._post(manager, "/api/full_probe", token=True)
+            manager._full_probe_thread.join(timeout=30)
+        finally:
+            manager.stop()
+
+        self.assertEqual([77, 77],
+                         [n["real_latency_ms"] for n in manager._nodes])
+        self.assertEqual([77, 77],
+                         [ep["real_latency_ms"]
+                          for ep in manager.status["endpoints"]])
+
 
 class AuthTests(unittest.TestCase):
     TOKEN = "test-admin-token-0123456789abcdef"
@@ -376,10 +469,10 @@ class EnvValidationTests(unittest.TestCase):
 
         self.assertEqual(0, config["limit"])
 
-    def test_real_topk_defaults_to_five(self) -> None:
+    def test_real_topk_defaults_to_thirty(self) -> None:
         config = build_config_from_env(self._env())
 
-        self.assertEqual(5, config["real_topk"])
+        self.assertEqual(30, config["real_topk"])
 
     def test_default_fetch_rejects_plain_http(self) -> None:
         with self.assertRaises(ValueError):
