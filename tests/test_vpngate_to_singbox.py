@@ -208,16 +208,25 @@ class NodesToEndpointsTests(unittest.TestCase):
 
 
 class FailoverConfigTests(unittest.TestCase):
-    def test_urltest_covers_direct_and_tuned_params(self) -> None:
+    def test_urltest_is_vpn_only_and_tuned_params(self) -> None:
         endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
         cfg = build_singbox_config([endpoint], final="auto")
 
         self.assertEqual("auto", cfg["route"]["final"])
         urltest = next(o for o in cfg["outbounds"] if o["type"] == "urltest")
-        self.assertIn("direct", urltest["outbounds"])
+        # direct must NOT be in the auto urltest group: it always wins on
+        # speed and would silently route all serving traffic around the VPN.
+        self.assertNotIn("direct", urltest["outbounds"])
         self.assertIn("vpngate-0", urltest["outbounds"])
         self.assertEqual("1m", urltest["interval"])
         self.assertEqual(800, urltest["tolerance"])
+
+    def test_direct_remains_in_manual_selector_as_explicit_fallback(self) -> None:
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+        cfg = build_singbox_config([endpoint], final="auto")
+
+        selector = next(o for o in cfg["outbounds"] if o["type"] == "selector")
+        self.assertEqual(["vpngate-0", "direct"], selector["outbounds"])
 
     def test_default_final_is_auto(self) -> None:
         endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")

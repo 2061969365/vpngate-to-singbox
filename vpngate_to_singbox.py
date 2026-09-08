@@ -280,8 +280,8 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
     """Throwaway single-endpoint config with the route pinned to the probe tag.
 
     The serving config defaults route.final to the "auto" urltest group
-    (which includes direct) -- right for serving, wrong for measuring: urltest
-    would route around the endpoint under test. Probing must exit only
+    (VPN-only) -- right for serving, wrong for measuring: urltest would route
+    around the endpoint under test. Probing must exit only
     through the endpoint, like the proven manual dial path.
     """
     probe_endpoint = dict(endpoint)
@@ -549,8 +549,10 @@ def build_singbox_config(
 
     route.final defaults to the "auto" urltest group so traffic fails over
     across healthy nodes automatically; pass an endpoint tag to pin one.
-    The urltest group always contains "direct" as a last-resort outlet so
-    a total VPNGate outage degrades to direct instead of blackholing.
+    The urltest group is VPN-only (fail-closed): "direct" must NOT be in it
+    because a local direct outlet always wins urltest on speed and would
+    silently route all serving traffic around the VPN. "direct" stays in the
+    manual "proxy" selector as an explicit user-chosen fallback.
     """
     tags = [ep["tag"] for ep in endpoints]
     config: dict = {
@@ -558,7 +560,7 @@ def build_singbox_config(
         "endpoints": endpoints,
         "outbounds": [
             {"type": "selector", "tag": "proxy", "outbounds": tags + ["direct"]},
-            {"type": "urltest", "tag": "auto", "outbounds": tags + ["direct"],
+            {"type": "urltest", "tag": "auto", "outbounds": tags,
              "interval": "1m", "tolerance": 800},
             {"type": "direct", "tag": "direct"},
         ],
