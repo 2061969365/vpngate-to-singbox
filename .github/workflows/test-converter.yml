@@ -362,25 +362,59 @@ jobs:
         if: always()
         run: docker rm -f vpngate-test || true
 
-  deploy-railway:
-    name: Deploy to Railway
+  trial-run:
+    name: Trial run (real dial + exit IP via container proxy)
     needs: railway-build
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - name: Install Railway CLI
-        # Pinned: CLI 5.3.0+ ignores RAILWAY_TOKEN in CI ("Not signed in" regression).
-        # Railway service must use Dockerfile.railway as its builder (Dashboard setting).
-        run: npm install -g @railway/cli@5.2.0
-      - name: Deploy to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
-          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-          RAILWAY_ENVIRONMENT: ${{ secrets.RAILWAY_ENVIRONMENT }}
+      - name: Build railway image
+        run: docker build -f Dockerfile.railway -t vpngate-railway:trial .
+      - name: Run container with real dial
         run: |
-          [ -n "$RAILWAY_TOKEN" ] || { echo "::error::Missing RAILWAY_TOKEN secret. Create a project token in the Railway Dashboard and add it as a repo secret named RAILWAY_TOKEN."; exit 1; }
-          [ -n "$RAILWAY_PROJECT_ID" ] || { echo "::error::Missing RAILWAY_PROJECT_ID secret. Add the Railway project ID as a repo secret named RAILWAY_PROJECT_ID."; exit 1; }
-          [ -n "$RAILWAY_SERVICE_ID" ] || { echo "::error::Missing RAILWAY_SERVICE_ID secret. Add the Railway service ID as a repo secret named RAILWAY_SERVICE_ID."; exit 1; }
-          railway up --project "$RAILWAY_PROJECT_ID" --environment "${RAILWAY_ENVIRONMENT:-production}" --service "$RAILWAY_SERVICE_ID" --detach -m "deploy ${GITHUB_SHA}"
+          docker run -d --name vpngate-trial -p 8080:8080 \
+            -e PORT=8080 -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
+            -e ADMIN_TOKEN=trial-admin-token-0123456789 \
+            -e LIMIT=12 -e REAL_TOPK=2 \
+            vpngate-railway:trial
+          for i in $(seq 1 30); do
+            if curl -m 5 -s http://127.0.0.1:8080/healthz | grep -q "^ok$"; then
+              echo "healthz OK after ~$((i * 10))s"
+              break
+            fi
+            sleep 10
+          done
+          curl -m 10 -s http://127.0.0.1:8080/healthz | grep -q "^ok$" || {
+            echo "healthz never OK; container log tail:"; docker logs vpngate-trial 2>&1 | tail -n 30; exit 1; }
+          curl -m 10 -s -H "Authorization: Bearer trial-admin-token-0123456789" \
+            http://127.0.0.1:8080/api/status | tee /tmp/trial-status.json | python3 -m json.tool
+          python3 - <<'EOF'
+          import json
+          status = json.load(open("/tmp/trial-status.json"))
+          measured = [e for e in status["endpoints"] if e.get("real_latency_ms") is not None]
+          print(f"trial: {len(status['endpoints'])} endpoints, {len(measured)} with real latency")
+          assert measured, "trial: no endpoint finished a real dial"
+          EOF
+      - name: Verify exit IP through container SOCKS5
+        run: |
+          DIRECT_IP=$(curl -m 20 -s https://api.ipify.org)
+          echo "runner direct IP: $DIRECT_IP"
+          test -n "$DIRECT_IP"
+          for i in $(seq 1 12); do
+            if EXIT_IP=$(curl -m 60 -s -x socks5h://u:0123456789abcdef@127.0.0.1:8080 https://api.ipify.org); then
+              echo "attempt $i: exit IP via container proxy: $EXIT_IP"
+              if [ -n "$EXIT_IP" ] && [ "$EXIT_IP" != "$DIRECT_IP" ]; then
+                echo "TRIAL OK: container proxy exits via VPNGate, no TUN used"
+                exit 0
+              fi
+            else
+              echo "attempt $i: proxy request failed, retrying..."
+            fi
+            sleep 15
+          done
+          echo "container log tail:"; docker logs vpngate-trial 2>&1 | tail -n 30
+          echo "exit IP never differed from direct IP"; exit 1
+      - name: Cleanup
+        if: always()
+        run: docker rm -f vpngate-trial || true
