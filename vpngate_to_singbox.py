@@ -27,6 +27,7 @@ _REMOTE_RE = re.compile(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(\S+))?\s*$", re.IGNOR
 _PROTO_RE = re.compile(r"^\s*proto\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 _AUTH_RE = re.compile(r"^\s*auth\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 _CIPHER_RE = re.compile(r"^\s*cipher\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+_KEY_DIRECTION_RE = re.compile(r"^\s*key-direction\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _is_tcp_proto(proto: str) -> bool:
@@ -82,6 +83,19 @@ def ovpn_to_endpoint(
         tls["client_certificate"] = blocks["cert"]
     if blocks.get("key"):
         tls["client_key"] = blocks["key"]
+    # sing-box control_wrap replaces OpenVPN tls-auth/tls-crypt inline keys.
+    # Dropping them silently breaks the handshake, so map them explicitly.
+    if blocks.get("tls-crypt"):
+        control_wrap: dict = {"type": "tls_crypt", "key": blocks["tls-crypt"]}
+    elif blocks.get("tls-auth"):
+        control_wrap = {"type": "tls_auth", "key": blocks["tls-auth"]}
+    else:
+        control_wrap = {}
+    if control_wrap:
+        direction_m = _KEY_DIRECTION_RE.search(config_text)
+        if direction_m:
+            control_wrap["direction"] = int(direction_m.group(1))
+        tls["control_wrap"] = control_wrap
 
     return {
         "type": "openvpn-client",

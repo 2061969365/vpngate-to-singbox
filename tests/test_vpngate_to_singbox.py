@@ -576,5 +576,36 @@ class DialProbeConfigTests(unittest.TestCase):
         self.assertEqual("auto", config["route"]["final"])
 
 
+class ControlWrapTests(unittest.TestCase):
+    TLS_AUTH_OVPN = TCP_OVPN + """\
+key-direction 1
+<tls-auth>
+VE9LRU4=
+</tls-auth>
+"""
+
+    TLS_CRYPT_OVPN = TCP_OVPN + """\
+<tls-crypt>
+Q1JZUFRfS0VZ
+</tls-crypt>
+"""
+
+    def test_tls_auth_block_maps_to_control_wrap(self) -> None:
+        ep = ovpn_to_endpoint(self.TLS_AUTH_OVPN, tag="vpngate-ta")
+
+        self.assertEqual(
+            {"type": "tls_auth", "key": "VE9LRU4=", "direction": 1},
+            ep["tls"]["control_wrap"],
+        )
+
+    def test_tls_crypt_block_maps_to_control_wrap(self) -> None:
+        ep = ovpn_to_endpoint(self.TLS_CRYPT_OVPN, tag="vpngate-tc")
+
+        self.assertEqual(
+            {"type": "tls_crypt", "key": "Q1JZUFRfS0VZ"},
+            ep["tls"]["control_wrap"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
