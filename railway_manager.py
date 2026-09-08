@@ -177,6 +177,7 @@ table.bench td.op a:hover{text-decoration:underline}
 <script>
 var activeCountry = "";
 var lastStatus = null;
+var probeSeq = 0, fullSeq = 0, verifySeq = 0;
 function authHeaders() {
   return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
 }
@@ -186,6 +187,7 @@ function showConsole() {
   refresh();
 }
 function lockConsole() {
+  probeSeq++; fullSeq++; verifySeq++;
   localStorage.removeItem("admin_token");
   document.getElementById("console").style.display = "none";
   const gate = document.getElementById("login-gate");
@@ -330,18 +332,21 @@ async function switchTag(tag) {
   refresh();
 }
 async function probeOne(tag) {
+  const my = ++probeSeq;
   try {
     await api("/api/probe", "POST", {"tag": tag});
     toast("单测 " + tag + " 进行中…");
     for (let i = 0; i < 40; i++) {
+      if (my !== probeSeq) break;
       await new Promise(r => setTimeout(r, 3000));
+      if (my !== probeSeq) break;
       const s = await api("/api/status");
       lastStatus = s;
-      renderProbeProgress(s.full_probe);
       if (s.probe && s.probe.state === "done" && s.probe.tag === tag) {
         toast(s.probe.ms != null ? ("单测 " + tag + " 完成：" + s.probe.ms + "ms") : ("单测 " + tag + " 未打通"));
         break;
       }
+      if (i === 39) toast("单测超时，请重试", true);
     }
   } catch (e) { toast("单测失败: " + e.message, true); }
   refresh();
@@ -356,12 +361,15 @@ async function refreshNow() {
   refresh();
 }
 async function fullProbeNow() {
+  const my = ++fullSeq;
   setBusy("btn-fullprobe", true, "真测中…");
   try {
     await api("/api/full_probe", "POST", {});
     toast("全量真测已开始，后台逐个拨号…");
     for (let i = 0; i < 200; i++) {
+      if (my !== fullSeq) break;
       await new Promise(r => setTimeout(r, 3000));
+      if (my !== fullSeq) break;
       const s = await api("/api/status");
       lastStatus = s;
       renderProbeProgress(s.full_probe);
@@ -369,18 +377,22 @@ async function fullProbeNow() {
         toast("全量真测完成：" + s.full_probe.done + "/" + s.full_probe.total);
         break;
       }
+      if (i === 199) toast("全量真测超时，请重试", true);
     }
   } catch (e) { toast("全量真测失败: " + e.message, true); }
   setBusy("btn-fullprobe", false);
   refresh();
 }
 async function verifyExit() {
+  const my = ++verifySeq;
   setBusy("btn-verify", true, "验证中…");
   document.getElementById("verify-result").textContent = "正在建立 VPN 链路并抓取出口 IP…";
   try {
     await api("/api/verify", "POST", {});
     for (let i = 0; i < 40; i++) {
+      if (my !== verifySeq) break;
       await new Promise(r => setTimeout(r, 3000));
+      if (my !== verifySeq) break;
       const s = await api("/api/status");
       lastStatus = s;
       renderVerify(s.verify);
@@ -388,6 +400,7 @@ async function verifyExit() {
         toast(s.verify.exit_ip ? ("出口 IP：" + s.verify.exit_ip) : "验证未拿到出口 IP", !s.verify.exit_ip);
         break;
       }
+      if (i === 39) toast("验证超时，请重试", true);
     }
   } catch (e) {
     document.getElementById("verify-result").textContent = "";
@@ -809,7 +822,12 @@ class RailwayManager:
             client.sendall(_http_response(
                 "200 OK", "application/json", json.dumps({"ok": ok}).encode()))
         elif path == "/api/full_probe" and method == "POST":
-            self._start_full_probe()
+            if not self._start_full_probe():
+                client.sendall(_http_response(
+                    "409 Conflict", "application/json",
+                    json.dumps({"accepted": False,
+                                "error": "already running"}).encode()))
+                return
             client.sendall(_http_response(
                 "202 Accepted", "application/json",
                 json.dumps({"accepted": True}).encode()))
@@ -1291,13 +1309,16 @@ class RailwayManager:
         print(f"refresh failed: {reason}", flush=True)
         return False
 
-    def _start_full_probe(self) -> None:
+    def _start_full_probe(self) -> bool:
         with self._lock:
+            if self.status["full_probe"].get("state") == "running":
+                return False
             self.status["full_probe"] = {"state": "running", "done": 0,
                                          "total": len(self._nodes)}
         thread = threading.Thread(target=self._run_full_probe, daemon=True)
         self._full_probe_thread = thread
         thread.start()
+        return True
 
     def _run_full_probe(self) -> None:
         # Startup gate so /api/status readers can observe the "running"

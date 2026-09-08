@@ -422,6 +422,20 @@ class FullProbeTests(unittest.TestCase):
 
         self.assertIn("401", status_line)
 
+    def test_full_probe_busy_when_already_running(self) -> None:
+        manager = self._manager(dial_fn=lambda node: time.sleep(0.5) or 50)
+        try:
+            self._seed_nodes(manager, "203.0.113.11")
+            status_line, body = self._post(manager, "/api/full_probe", token=True)
+            self.assertIn("202", status_line)
+            status2, body2 = self._post(manager, "/api/full_probe", token=True)
+            manager._full_probe_thread.join(timeout=30)
+        finally:
+            manager.stop()
+
+        self.assertIn("409", status2)
+        self.assertFalse(json.loads(body2.decode()).get("accepted", True))
+
     def test_full_probe_accepts_and_runs_in_background(self) -> None:
         manager = self._manager(dial_fn=lambda node: 50)
         try:
@@ -1332,6 +1346,11 @@ class GlassUiTests(unittest.TestCase):
 
     def test_verify_exit_fn_present(self) -> None:
         self.assertIn("verifyExit(", UI_HTML)
+
+    def test_poll_token_present(self) -> None:
+        self.assertIn("probeSeq", UI_HTML)
+        self.assertIn("verifySeq", UI_HTML)
+        self.assertIn("fullSeq", UI_HTML)
 
     def test_served_js_parses(self) -> None:
         """Extract <script> from the RUNTIME UI_HTML (post-Python-unescape)
