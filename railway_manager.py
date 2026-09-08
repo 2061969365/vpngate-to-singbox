@@ -199,8 +199,11 @@ def default_fetch(url: str, timeout: int = 20) -> str:
 
 def build_config_from_env(env: dict) -> dict:
     """Validate deployment env. Exits nonzero on weak credentials or plain-http."""
-    password = env.get("PROXY_PASS", "p")
-    if len(password) < MIN_PROXY_PASS_LEN:
+    password = env.get("PROXY_PASS", "")
+    if not password:
+        password = secrets.token_urlsafe(24)
+        print("PROXY_PASS not set, generated a random one", flush=True)
+    elif len(password) < MIN_PROXY_PASS_LEN:
         print(f"refusing to start: PROXY_PASS must be at least {MIN_PROXY_PASS_LEN} chars",
               flush=True)
         raise SystemExit(2)

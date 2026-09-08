@@ -487,6 +487,19 @@ class EnvValidationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_config_from_env(self._env(PROXY_PASS="p"))
 
+    def test_missing_proxy_pass_is_generated(self) -> None:
+        env = {"PORT": "8080", "PROXY_USER": "u"}
+        config = build_config_from_env(env)
+
+        self.assertGreaterEqual(len(config["password"]), 16)
+
+    def test_missing_proxy_pass_generates_unique_values(self) -> None:
+        env = {"PORT": "8080", "PROXY_USER": "u"}
+        first = build_config_from_env(dict(env))["password"]
+        second = build_config_from_env(dict(env))["password"]
+
+        self.assertNotEqual(first, second)
+
     def test_non_https_snapshot_url_exits_nonzero(self) -> None:
         with self.assertRaises(SystemExit):
             build_config_from_env(self._env(SNAPSHOT_URL="http://example.com/x.csv"))
