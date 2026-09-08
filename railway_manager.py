@@ -300,7 +300,12 @@ class RailwayManager:
         return self.bound_port
 
     def _initial_refresh(self) -> None:
-        if not self.refresh_once():
+        # Fast path first: serve the last-good config within seconds so
+        # /healthz goes 200 before the (minutes-long) first live refresh
+        # finishes. Without this the deploy healthcheck only sees 503.
+        if self._boot_from_last_good():
+            self.refresh_once()
+        elif not self.refresh_once():
             self._boot_from_last_good()
 
     def stop(self) -> None:

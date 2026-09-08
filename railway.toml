@@ -1,4 +1,9 @@
 # Railway service config for vpngate-to-singbox.
+# NOTE: Config as Code is deprecated by Railway. Services in projects created
+# after 2026-08-28 ignore this file; all services stop reading it on
+# 2026-12-01 (hard cutoff). Source of truth is Dashboard Settings
+# (Builder=DOCKERFILE, Dockerfile Path=Dockerfile.railway); to migrate to
+# the new IaC model run `railway config migrate` (see README).
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile.railway"

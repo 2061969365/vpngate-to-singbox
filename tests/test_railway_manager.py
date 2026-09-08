@@ -12,7 +12,8 @@ import unittest
 from unittest import mock
 
 from railway_manager import RailwayManager, build_config_from_env, classify_first_bytes, default_fetch
-from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
+from vpngate_to_singbox import (build_singbox_config, nodes_to_endpoints,
+                                ovpn_to_endpoint, snapshot_to_nodes)
 
 
 @contextlib.contextmanager
@@ -676,6 +677,89 @@ class SwitchRealLatencyTests(unittest.TestCase):
                 self.assertEqual(tag12, manager.preferred_tag)
             finally:
                 manager.stop()
+
+
+class ColdStartTests(unittest.TestCase):
+    def _paths(self, tmpdir: str) -> dict:
+        return dict(config_path=f"{tmpdir}/singbox.json",
+                    nodes_path=f"{tmpdir}/nodes.json",
+                    state_path=f"{tmpdir}/state.json")
+
+    def _seed_last_good(self, tmpdir: str) -> None:
+        seed = RailwayManager(
+            port=0, mixed_port=get_free_port(),
+            start_singbox=False, auto_refresh=False, fetch_on_start=False,
+            **self._paths(tmpdir))
+        nodes = snapshot_to_nodes(
+            _snapshot_csv("203.0.113.21", "203.0.113.22"), probe=False)
+        seed._nodes = nodes
+        seed._persist_nodes()
+        endpoints = nodes_to_endpoints(nodes)
+        with open(seed.last_good_path, "w", encoding="utf-8") as handle:
+            json.dump(build_singbox_config(endpoints, "127.0.0.1",
+                                          seed.mixed_port), handle)
+
+    def test_boot_attempted_before_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(),
+                start_singbox=False, auto_refresh=False, fetch_on_start=False,
+                **self._paths(tmpdir))
+            calls = []
+            with mock.patch.object(
+                    RailwayManager, "_boot_from_last_good",
+                    side_effect=lambda: calls.append("boot") or True), \
+                 mock.patch.object(
+                    RailwayManager, "refresh_once",
+                    side_effect=lambda: calls.append("refresh") or True):
+                manager._initial_refresh()
+            self.assertEqual(["boot", "refresh"], calls)
+
+    def test_serves_last_good_while_refresh_in_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._seed_last_good(tmpdir)
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(),
+                start_singbox=False, auto_refresh=False, fetch_on_start=False,
+                **self._paths(tmpdir))
+            gate = threading.Event()
+            entered = threading.Event()
+
+            def slow_refresh():
+                entered.set()
+                gate.wait(30)
+                return True
+
+            try:
+                with mock.patch.object(RailwayManager, "refresh_once",
+                                       side_effect=slow_refresh):
+                    thread = threading.Thread(target=manager._initial_refresh,
+                                              daemon=True)
+                    thread.start()
+                    self.assertTrue(entered.wait(10))
+                    deadline = time.monotonic() + 10
+                    while not manager.status["endpoints"] \
+                            and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                    self.assertTrue(manager.status["endpoints"],
+                                    "last-good not served while refresh in flight")
+                    self.assertTrue(manager._healthy())
+                    self.assertTrue(thread.is_alive(),
+                                    "refresh should still be running")
+            finally:
+                gate.set()
+
+    def test_no_last_good_no_endpoints_stays_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(),
+                start_singbox=False, auto_refresh=False, fetch_on_start=False,
+                **self._paths(tmpdir))
+            with mock.patch.object(RailwayManager, "refresh_once",
+                                   return_value=False):
+                manager._initial_refresh()
+            self.assertFalse(manager._healthy())
+            self.assertEqual([], manager.status["endpoints"])
 
 
 if __name__ == "__main__":
