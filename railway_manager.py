@@ -49,6 +49,9 @@ MIN_ADMIN_TOKEN_LEN = 16
 HEALTH_CHECK_INTERVAL = 60
 PINNED_FAIL_THRESHOLD = 3
 SUPERVISE_INTERVAL = 10
+# Cold start uses a bounded Speed-ranked chunk so the first config lands in
+# seconds and /healthz goes 200 fast; periodic refreshes scan everything.
+INITIAL_PROBE_POOL = 30
 CRASH_BACKOFFS = (5, 10, 20, 40, 300)
 MAX_CRASH_STREAK = 5
 
@@ -383,7 +386,7 @@ class RailwayManager:
         # finishes. Without this the deploy healthcheck only sees 503.
         if self._boot_from_last_good():
             self.refresh_once()
-        elif not self.refresh_once():
+        elif not self.refresh_once(probe_pool=INITIAL_PROBE_POOL):
             self._boot_from_last_good()
 
     def stop(self) -> None:
@@ -816,12 +819,12 @@ class RailwayManager:
                 self._restart_singbox()
             return True
 
-    def refresh_once(self, fetcher=None) -> bool:
+    def refresh_once(self, fetcher=None, probe_pool: int = 0) -> bool:
         try:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)
             nodes = snapshot_to_nodes(csv_text, limit=self.limit,
-                                       probe_pool=0,
+                                      probe_pool=probe_pool,
                                        probe_fn=lambda h, p: probe_tcp_latency(h, p, 5),
                                        real_topk=self.real_topk, dial_fn=self.dial_fn,
                                        singbox_bin=self.singbox_bin)

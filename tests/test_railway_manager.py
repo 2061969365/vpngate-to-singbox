@@ -268,6 +268,35 @@ class RefreshTests(unittest.TestCase):
         _, kwargs = snapshot_mock.call_args
         self.assertEqual(0, kwargs.get("probe_pool"))
 
+    def test_refresh_once_accepts_probe_pool_override(self) -> None:
+        manager = self._manager()
+        try:
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            return_value=[]) as snapshot_mock:
+                manager.refresh_once(
+                    fetcher=lambda url, timeout: _snapshot_csv("203.0.113.11"),
+                    probe_pool=30)
+        finally:
+            manager.stop()
+
+        _, kwargs = snapshot_mock.call_args
+        self.assertEqual(30, kwargs.get("probe_pool"))
+
+    def test_initial_refresh_uses_bounded_pool_for_fast_cold_start(self) -> None:
+        from railway_manager import INITIAL_PROBE_POOL
+        manager = self._manager()
+        try:
+            with mock.patch.object(RailwayManager, "_boot_from_last_good",
+                                   return_value=False), \
+                 mock.patch.object(RailwayManager, "refresh_once",
+                                   return_value=True) as refresh_mock:
+                manager._initial_refresh()
+        finally:
+            manager.stop()
+
+        _, kwargs = refresh_mock.call_args
+        self.assertEqual(INITIAL_PROBE_POOL, kwargs.get("probe_pool"))
+
 
 class FullProbeTests(unittest.TestCase):
     TOKEN = "test-admin-token-0123456789abcdef"
