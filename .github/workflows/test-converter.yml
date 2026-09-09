@@ -4,8 +4,7 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "17 * * * *" # hourly live check against the real VPNGate API
+   against the real VPNGate API
 
 jobs:
   test:
