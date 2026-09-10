@@ -140,10 +140,17 @@ table.bench td.op a:hover{text-decoration:underline}
 #btn-lock{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
 #btn-lock:hover{background:rgba(255,255,255,.14)}
 @media(max-width:768px){#hero-kicker{font-size:34px}.wrap{padding:20px 14px 44px}.stats{grid-template-columns:repeat(2,1fr)}#topnav .links{display:none}}
+#bench-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table.bench{min-width:560px}
+table.bench td.op a{display:inline-block;padding:6px 10px;margin-right:4px;border-radius:8px}
+table.bench td.op a.disabled{opacity:.38;cursor:not-allowed;text-decoration:none}
+table.bench td.op a.disabled:hover{text-decoration:none}
+@media(max-width:640px){.wrap{padding:16px 12px 40px}.glass-card{padding:20px 16px;border-radius:18px}#hero-kicker{font-size:30px}.stats{gap:10px}.stat{padding:12px 14px}.stat .v{font-size:20px}#node-search{width:100%;max-width:none}.actions .btn{flex:1 1 100%;text-align:center}#topnav{padding:12px 16px;gap:14px}#topnav .live{display:none}.glass-card,.stat{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}#toast{right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));left:max(12px,env(safe-area-inset-left))}.toast-msg{max-width:none}}
+
 </style></head>
 <body>
 <div id="topnav"><span class="logo">vpngate</span><span class="live">● LIVE</span><span class="links"><span>总览</span><span>节点</span><span>历史</span></span><span class="right"><button id="btn-lock" onclick="lockConsole()">锁定</button></span></div>
-<div id="login-gate"><div class="login-card glass-card"><div class="logo">vpngate</div><div class="sub">输入 ADMIN_TOKEN 进入控制台</div><input id="login-token" type="password" placeholder="ADMIN_TOKEN" onkeydown="if(event.key==='Enter')loginEnter()"><button id="btn-login" onclick="loginEnter()">进入控制台</button><p id="login-err"></p></div></div>
+<div id="login-gate"><div class="login-card glass-card"><div class="logo">vpngate</div><div class="sub">输入 ADMIN_TOKEN 进入控制台</div><input id="login-token" type="password" autocomplete="off" aria-label="ADMIN_TOKEN" placeholder="ADMIN_TOKEN" onkeydown="if(event.key==='Enter')loginEnter()"><button id="btn-login" onclick="loginEnter()">进入控制台</button><p id="login-err"></p></div></div>
 <div class="wrap" id="console" style="display:none">
 <div id="exit-card" class="glass-card">
 <div id="hero-kicker">—<br>—</div>
@@ -160,10 +167,10 @@ table.bench td.op a:hover{text-decoration:underline}
 <div class="glass-card">
 <h2>可用节点</h2>
 <p class="desc">默认显示 Top30 实测节点（自动刷新只测前 30）。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底；要测全部点「全量真测」。</p>
-<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" placeholder="搜索 tag / 国家…" oninput="refresh()"><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button></div>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" placeholder="搜索 tag / 国家…" oninput="debouncedRefresh()"><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button></div>
 <div id="pills"></div>
-<div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill"></div></div><div class="txt" id="probe-txt"></div></div>
-<table class="bench"><thead><tr><th>Endpoint</th><th>国家</th><th>握手</th><th>实测</th><th>存活</th><th>操作</th></tr></thead><tbody id="bench-body"></tbody></table>
+<div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div><div class="txt" id="probe-txt"></div></div>
+<div id="bench-wrap"><table class="bench"><thead><tr><th>Endpoint</th><th>国家</th><th>握手</th><th>实测</th><th>存活</th><th>操作</th></tr></thead><tbody id="bench-body"></tbody></table></div>
 </div>
 <div class="glass-card">
 <h2>事件</h2>
@@ -178,6 +185,7 @@ table.bench td.op a:hover{text-decoration:underline}
 var activeCountry = "";
 var lastStatus = null;
 var probeSeq = 0, fullSeq = 0, verifySeq = 0;
+var searchTimer = null, pollCtl = null;
 function authHeaders() {
   return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
 }
@@ -188,6 +196,7 @@ function showConsole() {
 }
 function lockConsole() {
   probeSeq++; fullSeq++; verifySeq++;
+  if (pollCtl) { pollCtl.abort(); pollCtl = null; }
   localStorage.removeItem("admin_token");
   document.getElementById("console").style.display = "none";
   const gate = document.getElementById("login-gate");
@@ -230,6 +239,8 @@ async function silentLogin() {
 }
 function toast(msg, isErr) {
   const box = document.getElementById("toast");
+  if ([...box.children].some(c => c.textContent === msg)) return;
+  while (box.children.length >= 3) box.firstChild.remove();
   const el = document.createElement("div");
   el.className = "toast-msg" + (isErr ? " err" : "");
   el.textContent = msg;
@@ -250,24 +261,52 @@ function setBusy(id, busy, busyText) {
     if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig;
   }
 }
-async function api(path, method, body) {
+async function api(path, method, body, signal) {
   const r = await fetch(path, {method: method || "GET", headers: authHeaders(),
-    body: body ? JSON.stringify(body) : undefined});
+    body: body ? JSON.stringify(body) : undefined, signal: signal || undefined});
   if (r.status === 401) throw new Error("unauthorized: save ADMIN_TOKEN first");
   if (!r.ok) throw new Error("HTTP " + r.status + ": " + (await r.text()).slice(0, 160));
   return r.json();
 }
+function isAbort(e) { return !!e && e.name === "AbortError"; }
 function fmtMs(v) { return v == null ? "—" : v + "ms"; }
 function safeTag(t) { return String(t || "").replace(/[^a-zA-Z0-9-_]/g, ""); }
-function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 function nodeQuery() { const el = document.getElementById("node-search"); return el ? el.value.trim().toLowerCase() : ""; }
+function filteredEndpoints(s) {
+  const q = nodeQuery();
+  return s.endpoints.filter(e => (!activeCountry || e.country_short === activeCountry) &&
+    (!q || (e.tag || "").toLowerCase().includes(q) || (e.country_short || "").toLowerCase().includes(q) ||
+      (e.country || "").toLowerCase().includes(q) || (e.server || "").toLowerCase().includes(q)));
+}
+function debouncedRefresh() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { searchTimer = null; renderFiltered(); }, 300);
+}
+function clearFilter() {
+  activeCountry = "";
+  const el = document.getElementById("node-search");
+  if (el) el.value = "";
+  renderFiltered();
+}
 async function refresh() {
   try {
     const s = await api("/api/status");
     lastStatus = s;
-    const q = nodeQuery();
-    const eps = s.endpoints.filter(e => (!activeCountry || e.country_short === activeCountry) &&
-      (!q || (e.tag || "").toLowerCase().includes(q) || (e.country_short || "").toLowerCase().includes(q)));
+    renderAll(s);
+  } catch (e) {
+    if (isAbort(e)) return;
+    document.getElementById("hero-sub").textContent = "status fetch failed: " + e.message;
+    toast("状态拉取失败: " + e.message, true);
+  }
+}
+function renderFiltered() {
+  if (!lastStatus) { refresh(); return; }
+  renderAll(lastStatus);
+}
+function renderAll(s) {
+  try {
+    const eps = filteredEndpoints(s);
     const pref = s.endpoints.find(e => e.tag === s.preferred_tag) || eps[0];
     document.getElementById("hero-kicker").innerHTML =
       (pref ? esc(pref.country_short) + "<br>" + fmtMs(pref.real_latency_ms != null ? pref.real_latency_ms : pref.latency_ms) : "—<br>无节点");
@@ -280,26 +319,38 @@ async function refresh() {
     document.getElementById("stat-uptime").textContent = Math.floor((s.uptime_seconds || 0) / 60) + "m";
     document.getElementById("stat-refresh").textContent = s.refresh_ok + "/" + s.refresh_fail;
     document.getElementById("pills").innerHTML =
-      '<span data-c="" class="' + (activeCountry === "" ? "on" : "") + '">全部 ' + s.endpoints.length + "</span>" +
-      s.countries.map(c => '<span data-c="' + c.code + '" class="' + (activeCountry === c.code ? "on" : "") + '">' + esc(c.name) + "</span>").join("");
-    document.querySelectorAll("#pills span").forEach(el => el.onclick = () => { activeCountry = el.getAttribute("data-c"); refresh(); });
+      '<span role="button" tabindex="0" aria-pressed="' + (activeCountry === "") + '" data-c="" class="' + (activeCountry === "" ? "on" : "") + '">全部 ' + s.endpoints.length + "</span>" +
+      s.countries.map(c => '<span role="button" tabindex="0" aria-pressed="' + (activeCountry === c.code) + '" data-c="' + c.code + '" class="' + (activeCountry === c.code ? "on" : "") + '">' + esc(c.name) + "</span>").join("");
+    document.querySelectorAll("#pills span").forEach(el => {
+      const pick = () => { activeCountry = el.getAttribute("data-c"); renderFiltered(); };
+      el.onclick = pick;
+      el.onkeydown = (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); pick(); } };
+    });
     const probingTag = (s.probe && s.probe.state === "running") ? s.probe.tag : null;
-    document.getElementById("bench-body").innerHTML = eps.map(e => {
+    const rows = eps.map(e => {
       const t = safeTag(e.tag);
       const pinned = e.tag === s.preferred_tag ? '<span class="badge">pinned</span>' : "";
       const probing = e.tag === probingTag ? '<span class="badge probing">测速中</span>' : "";
+      const unmeasured = e.real_latency_ms == null;
+      const disSw = unmeasured ? ' aria-disabled="true" class="disabled"' : "";
+      const disPb = (e.tag === probingTag) ? ' aria-disabled="true" class="disabled"' : "";
       return "<tr><td class='hl'>" + esc(e.tag) + pinned + probing + "</td><td>" + esc(e.country_short) + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
       "</td><td class='hl'>" + fmtMs(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
-      "<td class='op'><a data-probe='" + t + "'>测速</a><a data-switch='" + t + "'>切换</a></td></tr>";
+      "<td class='op'><a role='button' tabindex='0' data-probe='" + t + "'" + disPb + ">测速</a><a role='button' tabindex='0' data-switch='" + t + "'" + disSw + ">切换</a></td></tr>";
     }).join("");
+    document.getElementById("bench-body").innerHTML = rows ||
+      '<tr><td colspan="6" style="text-align:center;color:#8b91a5;padding:24px">无匹配节点 · <a style="color:#8ab4ff;cursor:pointer" onclick="clearFilter()">清除筛选</a></td></tr>';
     renderProbeProgress(s.full_probe);
     document.getElementById("history-line").textContent =
-      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + s.last_error;
-    document.getElementById("history-list").innerHTML =
-      (s.refresh_history || []).slice().reverse().slice(0, 12).map(h => "<li><b>" + esc(h.event) + "</b> " + esc(h.detail || "") + " · " + esc(h.ts || "") + "</li>").join("");
+      "refresh ok/fail: " + s.refresh_ok + "/" + s.refresh_fail + " · uptime: " + s.uptime_seconds + "s · error: " + (s.last_error || "—");
+    const hist = (s.refresh_history || []).slice().reverse().slice(0, 12);
+    document.getElementById("history-list").innerHTML = hist.length ?
+      hist.map(h => "<li><b>" + esc(h.event) + "</b> " + esc(h.detail || "") + " · " + esc(h.ts || "") + "</li>").join("") :
+      '<li style="color:#8b91a5">暂无事件</li>';
     document.getElementById("foot-status").textContent = "uptime " + s.uptime_seconds + "s · refresh " + s.refresh_ok + "/" + s.refresh_fail;
   } catch (e) {
-    document.getElementById("hero-sub").textContent = "status fetch failed: " + e;
+    if (isAbort(e)) return;
+    document.getElementById("hero-sub").textContent = "status fetch failed: " + e.message;
     toast("状态拉取失败: " + e.message, true);
   }
 }
@@ -321,26 +372,33 @@ function renderProbeProgress(fp) {
   if (!fp || fp.state === "idle" || !fp.total) { box.classList.remove("show"); return; }
   box.classList.add("show");
   const pct = fp.total ? Math.round(fp.done / fp.total * 100) : 0;
-  document.getElementById("probe-fill").style.width = pct + "%";
+  const fill = document.getElementById("probe-fill");
+  fill.style.width = pct + "%";
+  fill.setAttribute("aria-valuenow", String(pct));
   document.getElementById("probe-txt").textContent = "全量真测 " + fp.state + " " + fp.done + "/" + fp.total + "（" + pct + "%）";
 }
 async function switchTag(tag) {
+  const ep = (lastStatus && lastStatus.endpoints || []).find(x => x.tag === tag);
+  if (ep && ep.real_latency_ms == null) { toast("先测速再切换：该节点还未测通", true); return; }
   try {
     const r = await api("/api/switch", "POST", {"tag": tag});
     toast("已切换到 " + (r.preferred_tag || tag));
-  } catch (e) { toast("切换失败: " + e.message, true); }
+  } catch (e) { if (!isAbort(e)) toast("切换失败: " + e.message, true); }
   refresh();
 }
 async function probeOne(tag) {
   const my = ++probeSeq;
+  if (pollCtl) pollCtl.abort();
+  pollCtl = new AbortController();
+  const sig = pollCtl.signal;
   try {
-    await api("/api/probe", "POST", {"tag": tag});
+    await api("/api/probe", "POST", {"tag": tag}, sig);
     toast("单测 " + tag + " 进行中…");
     for (let i = 0; i < 40; i++) {
       if (my !== probeSeq) break;
       await new Promise(r => setTimeout(r, 3000));
       if (my !== probeSeq) break;
-      const s = await api("/api/status");
+      const s = await api("/api/status", "GET", null, sig);
       lastStatus = s;
       if (s.probe && s.probe.state === "done" && s.probe.tag === tag) {
         toast(s.probe.ms != null ? ("单测 " + tag + " 完成：" + s.probe.ms + "ms") : ("单测 " + tag + " 未打通"));
@@ -348,29 +406,41 @@ async function probeOne(tag) {
       }
       if (i === 39) toast("单测超时，请重试", true);
     }
-  } catch (e) { toast("单测失败: " + e.message, true); }
+  } catch (e) { if (isAbort(e)) return; toast("单测失败: " + e.message, true); }
   refresh();
 }
 async function refreshNow() {
+  const btn = document.getElementById("btn-refresh");
+  if (btn && btn.disabled) return;
   setBusy("btn-refresh", true, "刷新中…");
   try {
     const r = await api("/api/refresh", "POST", {});
     toast(r.ok ? "节点已刷新" : "刷新完成但有失败");
-  } catch (e) { toast("刷新失败: " + e.message, true); }
+  } catch (e) { if (!isAbort(e)) toast("刷新失败: " + e.message, true); }
   setBusy("btn-refresh", false);
   refresh();
 }
 async function fullProbeNow() {
   const my = ++fullSeq;
+  if (pollCtl) pollCtl.abort();
+  pollCtl = new AbortController();
+  const sig = pollCtl.signal;
   setBusy("btn-fullprobe", true, "真测中…");
   try {
-    await api("/api/full_probe", "POST", {});
+    await api("/api/full_probe", "POST", {}, sig);
+  } catch (e) {
+    setBusy("btn-fullprobe", false);
+    if (isAbort(e)) return;
+    toast(/409/.test(e.message || "") ? "已有全量任务进行中，稍后再试" : ("全量真测失败: " + e.message), true);
+    return;
+  }
+  try {
     toast("全量真测已开始，后台逐个拨号…");
     for (let i = 0; i < 200; i++) {
       if (my !== fullSeq) break;
       await new Promise(r => setTimeout(r, 3000));
       if (my !== fullSeq) break;
-      const s = await api("/api/status");
+      const s = await api("/api/status", "GET", null, sig);
       lastStatus = s;
       renderProbeProgress(s.full_probe);
       if (s.full_probe && s.full_probe.state === "done") {
@@ -379,21 +449,24 @@ async function fullProbeNow() {
       }
       if (i === 199) toast("全量真测超时，请重试", true);
     }
-  } catch (e) { toast("全量真测失败: " + e.message, true); }
+  } catch (e) { if (!isAbort(e)) toast("全量真测失败: " + e.message, true); }
   setBusy("btn-fullprobe", false);
   refresh();
 }
 async function verifyExit() {
   const my = ++verifySeq;
+  if (pollCtl) pollCtl.abort();
+  pollCtl = new AbortController();
+  const sig = pollCtl.signal;
   setBusy("btn-verify", true, "验证中…");
   document.getElementById("verify-result").textContent = "正在建立 VPN 链路并抓取出口 IP…";
   try {
-    await api("/api/verify", "POST", {});
+    await api("/api/verify", "POST", {}, sig);
     for (let i = 0; i < 40; i++) {
       if (my !== verifySeq) break;
       await new Promise(r => setTimeout(r, 3000));
       if (my !== verifySeq) break;
-      const s = await api("/api/status");
+      const s = await api("/api/status", "GET", null, sig);
       lastStatus = s;
       renderVerify(s.verify);
       if (s.verify && s.verify.state === "done") {
@@ -403,7 +476,10 @@ async function verifyExit() {
       if (i === 39) toast("验证超时，请重试", true);
     }
   } catch (e) {
-    document.getElementById("verify-result").textContent = "";
+    if (isAbort(e)) return;
+    const el = document.getElementById("verify-result");
+    el.textContent = "验证失败：" + e.message;
+    el.style.color = "#fca5a5";
     toast("验证失败: " + e.message, true);
   }
   setBusy("btn-verify", false);
@@ -413,12 +489,31 @@ silentLogin();
 document.getElementById("bench-body").onclick = (ev) => {
   const link = ev.target && ev.target.closest ? ev.target.closest("a") : null;
   if (!link) return;
+  if (link.getAttribute("aria-disabled") === "true") {
+    if (link.getAttribute("data-switch")) toast("先测速再切换：该节点还未测通", true);
+    return;
+  }
   const p = link.getAttribute("data-probe");
   const sw = link.getAttribute("data-switch");
   if (p) probeOne(p);
   else if (sw) switchTag(sw);
 };
-setInterval(() => { if (document.getElementById("console").style.display !== "none") refresh(); }, 15000);
+document.getElementById("bench-body").onkeydown = (ev) => {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const link = ev.target && ev.target.closest ? ev.target.closest("a") : null;
+  if (!link || link.getAttribute("aria-disabled") === "true") return;
+  ev.preventDefault();
+  const p = link.getAttribute("data-probe");
+  const sw = link.getAttribute("data-switch");
+  if (p) probeOne(p);
+  else if (sw) switchTag(sw);
+};
+setInterval(() => {
+  if (document.getElementById("console").style.display === "none") return;
+  if (document.hidden) return;
+  if (document.querySelector(".btn.busy")) return;
+  refresh();
+}, 15000);
 </script>
 </body></html>
 """

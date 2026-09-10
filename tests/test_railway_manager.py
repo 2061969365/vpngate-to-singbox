@@ -1375,6 +1375,48 @@ class GlassUiTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
 
+class UiPolishTests(unittest.TestCase):
+    """T1-T5 interaction polish: debounce, abortable polls, bench guards,
+    toast cap, empty state, mobile."""
+
+    def test_search_debounced(self) -> None:
+        self.assertIn("debouncedRefresh", UI_HTML)
+        self.assertIn("oninput=\"debouncedRefresh()\"", UI_HTML)
+
+    def test_local_filter_without_fetch(self) -> None:
+        self.assertIn("renderFiltered", UI_HTML)
+
+    def test_fullprobe_409_toast(self) -> None:
+        self.assertIn("已有全量任务进行中", UI_HTML)
+
+    def test_polls_abortable(self) -> None:
+        self.assertIn("AbortController", UI_HTML)
+
+    def test_interval_skips_hidden(self) -> None:
+        self.assertIn("document.hidden", UI_HTML)
+
+    def test_switch_guarded_when_unmeasured(self) -> None:
+        self.assertIn("aria-disabled", UI_HTML)
+        self.assertIn("先测速", UI_HTML)
+
+    def test_esc_covers_quotes(self) -> None:
+        self.assertIn("&quot;", UI_HTML)
+
+    def test_toast_capped(self) -> None:
+        self.assertIn("children.length", UI_HTML)
+
+    def test_empty_filter_row(self) -> None:
+        self.assertIn("无匹配", UI_HTML)
+
+    def test_mobile_breakpoint(self) -> None:
+        self.assertIn("@media(max-width:640px)", UI_HTML)
+        self.assertIn("bench-wrap", UI_HTML)
+        self.assertIn("safe-area-inset", UI_HTML)
+
+    def test_login_input_accessible(self) -> None:
+        self.assertIn('autocomplete="off"', UI_HTML)
+
+
 class LoginGateTests(unittest.TestCase):
     """Token login gate: enter token first, console hidden until verified."""
 
