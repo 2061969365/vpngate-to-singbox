@@ -681,11 +681,23 @@ def snapshot_to_nodes(
 
 
 def nodes_to_endpoints(nodes: list[dict], tag_prefix: str = "vpngate") -> list[dict]:
-    """Assign tags and return clean sing-box endpoint dicts (no metadata keys)."""
+    """Assign tags and return clean sing-box endpoint dicts (no metadata keys).
+
+    Endpoints that already carry a tag (stable refresh mapping) keep it;
+    only untagged endpoints take the next free ``tag_prefix-N`` slot.
+    """
+    used = {str(n.get("endpoint", {}).get("tag") or "")
+            for n in nodes} - {""}
+    next_index = 0
     endpoints = []
-    for index, node in enumerate(nodes):
+    for node in nodes:
         endpoint = dict(node["endpoint"])
-        endpoint["tag"] = f"{tag_prefix}-{index}"
+        if not endpoint.get("tag"):
+            while f"{tag_prefix}-{next_index}" in used:
+                next_index += 1
+            endpoint["tag"] = f"{tag_prefix}-{next_index}"
+            used.add(endpoint["tag"])
+            next_index += 1
         node["endpoint"] = endpoint
         endpoints.append(endpoint)
     return endpoints
@@ -731,6 +743,7 @@ def build_singbox_config(
     mixed_port: int | None = None,
     mixed_users: list[tuple[str, str]] | None = None,
     final: str = "auto",
+    preferred: str | None = None,
     vless_uuid: str | None = None,
     vless_direct_port: int = 8080,
     vless_direct_path: str = "/ws-node",
@@ -745,25 +758,40 @@ def build_singbox_config(
     because a local direct outlet always wins urltest on speed and would
     silently route all serving traffic around the VPN. "direct" stays in the
     manual "proxy" selector as an explicit user-chosen fallback.
+    The urltest re-picks every 15s (tolerance 150ms) so a dead tunnel fails
+    over within seconds instead of minutes.
 
     When vless_uuid is set, two VLESS+WS inbounds are added for Cloudflare
     Tunnel use: "vless-direct" (Railway-local exit via "direct") and
-    "vless-chain" (VPNGate exit via the "chain-socks" socks5 outbound that
-    points at the mixed inbound). Route rules split by inbound tag, so the
-    two paths never mix. Requires the mixed inbound (the chain target).
+    "vless-chain" (VPNGate exit via "auto", or via the "chain" selector
+    when preferred). Route rules split by inbound tag, so the
+    two paths never mix. Requires the mixed inbound (the $PORT mux target).
+
+    When preferred names one of the endpoint tags, a "chain" selector
+    ([preferred, "auto"]) becomes route.final instead of the bare tag, so a
+    pinned node keeps hot-standby failover: preferred first, urltest group
+    the instant it goes unhealthy. No serving config ever pins route.final
+    to a single endpoint.
     """
     tags = [ep["tag"] for ep in endpoints]
+    if preferred is not None and preferred not in tags:
+        preferred = None
+    route_final = "chain" if preferred else final
     config: dict = {
         "log": {"level": "info"},
         "endpoints": endpoints,
         "outbounds": [
             {"type": "selector", "tag": "proxy", "outbounds": tags + ["direct"]},
             {"type": "urltest", "tag": "auto", "outbounds": tags,
-             "interval": "1m", "tolerance": 800},
+             "interval": "15s", "tolerance": 150},
             {"type": "direct", "tag": "direct"},
         ],
-        "route": {"final": final, "auto_detect_interface": True},
+        "route": {"final": route_final, "auto_detect_interface": True},
     }
+    if preferred:
+        config["outbounds"].append(
+            {"type": "selector", "tag": "chain",
+             "outbounds": [preferred, "auto"]})
     if mixed_listen is not None and mixed_port is not None:
         inbound: dict = {"type": "mixed", "tag": "mixed-in",
                          "listen": mixed_listen, "listen_port": mixed_port}
@@ -773,7 +801,7 @@ def build_singbox_config(
         config["inbounds"] = [inbound]
     if vless_uuid is not None:
         if mixed_listen is None or mixed_port is None:
-            raise ValueError("vless inbounds need the mixed inbound as chain target")
+            raise ValueError("vless inbounds need the mixed inbound ($PORT mux target)")
         config.setdefault("inbounds", []).extend([
             {"type": "vless", "tag": "vless-direct",
              "listen": "0.0.0.0", "listen_port": vless_direct_port,
@@ -784,15 +812,14 @@ def build_singbox_config(
              "users": [{"uuid": vless_uuid}],
              "transport": {"type": "ws", "path": vless_chain_path}},
         ])
-        chain_socks: dict = {"type": "socks", "tag": "chain-socks",
-                             "server": "127.0.0.1", "server_port": mixed_port,
-                             "version": "5"}
-        if mixed_users:
-            chain_socks["username"], chain_socks["password"] = mixed_users[0]
-        config["outbounds"].append(chain_socks)
+        # No loopback hop: vless-chain routes straight into the urltest group
+        # (or the "chain" selector when pinned), which is exactly where the
+        # old chain-socks -> mixed -> route.final path ended up. One less
+        # hop, and a dead mixed inbound no longer kills both VLESS paths.
+        chain_target = "chain" if preferred else "auto"
         config["route"]["rules"] = [
             {"inbound": "vless-direct", "outbound": "direct"},
-            {"inbound": "vless-chain", "outbound": "chain-socks"},
+            {"inbound": "vless-chain", "outbound": chain_target},
         ]
     return config
 
